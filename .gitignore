@@ -1,0 +1,9 @@
+.venv/
+.kilo_data/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+*.log
+.env

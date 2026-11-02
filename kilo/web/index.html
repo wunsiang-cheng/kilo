@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kilo</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/static/terminal.css">
+<script type="module" src="/static/main.js"></script>
+</head>
+<body>
+<main id="screen">
+  <div id="output" role="log"></div>
+
+  <form id="login" hidden>
+    <div class="line bright">Kilo · log in</div>
+    <label class="field"><span>login:</span><input id="username" name="username" autocomplete="username" autocapitalize="off" spellcheck="false" required></label>
+    <label class="field"><span>password:</span><input id="password" name="password" type="password" autocomplete="current-password" required></label>
+    <button type="submit">[ log in ]</button>
+    <div id="login-error" class="line err" role="alert"></div>
+  </form>
+
+  <form id="prompt-line" hidden>
+    <label id="prompt" for="input">kilo&gt;</label>
+    <textarea id="input" rows="1" spellcheck="false" autocomplete="off" autocapitalize="off" aria-label="Message or /command"></textarea>
+  </form>
+</main>
+</body>
+</html>
