@@ -533,3 +533,12 @@ def test_a_summary_keeps_what_images_showed():
         "- What the images and documents read so far showed, where it matters later; "
         "images are not kept after this summary." in COMPACTION_INSTRUCTIONS
     )
+
+
+async def test_read_file_shows_an_image_to_the_model(kilo, model, session, workspace, data_dir):
+    Image.new("RGB", (64, 32), "red").save(workspace / "red.png")
+    model.turns.extend([tool_turn("c1", "read_file", {"path": "red.png"}), text_turn("red")])
+    await collect(kilo, session.id, "what colour is red.png?")
+    last = model.requests[1][-1]
+    assert last["role"] == "user" and last["content"][0] == {"type": "text", "text": "[Image: red.png]"}
+    assert last["content"][1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
