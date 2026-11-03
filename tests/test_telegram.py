@@ -83,7 +83,7 @@ async def api():
 async def bot(kilo, api, tmp_path):
     built = TelegramBot(
         api, TelegramStore(tmp_path / "kilo.db"), kilo.db, kilo.runner, kilo.scheduler, kilo.run_announcer,
-        frozenset({USER, FRIEND}), frozenset({GROUP}), edit_seconds=0,
+        frozenset({USER, FRIEND}), frozenset({GROUP}), edit_seconds=0, album_seconds=0.05,
     )
     await built.store.init()
     built.me = {"id": BOT_ID, "username": "kilo_bot"}
@@ -382,6 +382,64 @@ async def test_held_files_go_only_with_their_senders_message(bot, api, model):
     first, second = model.requests
     assert "Files sent" not in first[-1]["content"]
     assert "photo-" in second[-1]["content"] and "[Sent by Ann (@ann)" in second[-1]["content"]
+
+
+# ---------------------------------------------------------------------------
+# Albums
+
+
+async def test_an_album_is_one_message(bot, api, model):
+    for n in (1, 2, 3):
+        api.add_file(f"p{n}", f"photos/file_{n}.jpg", b"jpegdata")
+    model.turns.append(text_turn("Three photos."))
+    await bot.handle(message(caption="compare these", photo=photo("p1"), media_group_id="g1", message_id=1))
+    await bot.handle(message(photo=photo("p2"), media_group_id="g1", message_id=2))
+    await bot.handle(message(photo=photo("p3"), media_group_id="g1", message_id=3))
+    await idle(bot)
+    [request] = model.requests
+    assert request[-1]["content"].startswith("compare these\n\n[Files sent")
+    assert request[-1]["content"].count("- uploads/") == 3
+
+
+async def test_an_album_without_a_caption_is_held_with_one_reply(bot, api, model):
+    for n in (1, 2):
+        api.add_file(f"p{n}", f"photos/file_{n}.jpg", b"jpegdata")
+    await bot.handle(message(photo=photo("p1"), media_group_id="g1", message_id=1))
+    await bot.handle(message(photo=photo("p2"), media_group_id="g1", message_id=2))
+    await idle(bot)
+    assert model.requests == []
+    assert api.sent() == ["📎 Saved 2 files (16 bytes). They go to the agent with your next message."]
+
+
+async def test_text_sent_while_an_album_gathers_takes_it_along(bot, api, model):
+    for n in (1, 2):
+        api.add_file(f"p{n}", f"photos/file_{n}.jpg", b"jpegdata")
+    model.turns.append(text_turn("ok"))
+    await bot.handle(message(photo=photo("p1"), media_group_id="g1", message_id=1))
+    await bot.handle(message(photo=photo("p2"), media_group_id="g1", message_id=2))
+    await bot.handle(message("these two"))
+    await idle(bot)
+    [request] = model.requests
+    assert request[-1]["content"].startswith("these two\n\n[Files sent")
+    assert request[-1]["content"].count("- uploads/") == 2
+
+
+async def test_a_group_album_counts_when_one_item_is_meant_for_the_bot(bot, api, model):
+    for n in (1, 2):
+        api.add_file(f"p{n}", f"photos/file_{n}.jpg", b"jpegdata")
+    model.turns.append(text_turn("ok"))
+    await bot.handle(group(caption="@kilo_bot which is better?", photo=photo("p1"), media_group_id="g1", message_id=1))
+    await bot.handle(group(photo=photo("p2"), media_group_id="g1", message_id=2))
+    await idle(bot)
+    [request] = model.requests
+    assert request[-1]["content"].count("- uploads/") == 2
+
+
+async def test_a_group_album_not_meant_for_the_bot_is_not_fetched(bot, api):
+    api.add_file("p1", "photos/file_1.jpg", b"jpegdata")
+    await bot.handle(group(photo=photo("p1"), media_group_id="g1", message_id=1))
+    await idle(bot)
+    assert not [c for c in api.calls if c[0] == "getFile"]
 
 
 # ---------------------------------------------------------------------------

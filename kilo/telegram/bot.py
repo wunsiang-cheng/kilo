@@ -46,6 +46,7 @@ SESSIONS_SHOWN = 10
 NO_PREVIEW = {"is_disabled": True}
 GROUP_TYPES = ("group", "supergroup")
 TELEGRAM_FILE_LIMIT = 20 * 1024 * 1024  # the largest file a bot may fetch from Telegram
+ALBUM_SECONDS = 1.0  # an album (its items come as messages of their own) is whole once no more of it came this long
 # The fields of a message that carry a file, in the order they are looked at (an animation comes with a document too).
 FILE_FIELDS = ("animation", "document", "photo", "video", "audio", "voice", "video_note")
 # How a file that came without a name is named (then the time and the extension Telegram gives), and spoken of.
@@ -225,6 +226,15 @@ class Intake:
         return self.worker is not None and not self.worker.done()
 
 
+@dataclass
+class Album:
+    """The messages of one media group (an album), gathered until no more of it come for a moment."""
+
+    messages: List[Dict[str, Any]]
+    complete: asyncio.Event = field(default_factory=asyncio.Event)
+    timer: Optional[asyncio.Task] = None
+
+
 class TelegramBot:
     def __init__(
         self,
@@ -237,14 +247,16 @@ class TelegramBot:
         allowed_users: FrozenSet[int],
         allowed_chats: FrozenSet[int] = frozenset(),
         edit_seconds: float = EDIT_SECONDS,
+        album_seconds: float = ALBUM_SECONDS,
     ):
         self.api, self.store, self.db, self.runner = api, store, db, runner
         self.scheduler, self.announcer = scheduler, announcer
         self.allowed_users, self.allowed_chats = allowed_users, allowed_chats
-        self.edit_seconds = edit_seconds
+        self.edit_seconds, self.album_seconds = edit_seconds, album_seconds
         self.me: Dict[str, Any] = {}  # the bot itself (getMe), to tell what in a group is meant for it
         self._chats: Dict[int, Chat] = {}
         self._intakes: Dict[int, Intake] = {}
+        self._albums: Dict[Tuple[int, str], Album] = {}  # (chat id, media group id) -> the album still gathering
         self._runs: Dict[str, TurnView] = {}  # session id -> the view of the system turn running there
         self._asked: Set[Tuple[str, str]] = set()  # (schedule id, proposal tag) of the proposals shown with buttons
         self._tasks: Set[asyncio.Task] = set()
@@ -335,8 +347,8 @@ class TelegramBot:
             if chat_id not in self.allowed_chats:
                 await self._leave(chat)
                 return
-            if not self._meant_for_me(message):
-                return
+            if not message.get("media_group_id") and not self._meant_for_me(message):
+                return  # an album is judged whole, once gathered (only one of its items may mention the bot)
         elif chat.get("type") != "private":
             return
         if sender.get("id") not in self.allowed_users:
@@ -379,11 +391,23 @@ class TelegramBot:
 
     async def _take_in(self, chat_id: int, message: Dict[str, Any]) -> None:
         """A message with text or files: taken in now when nothing sent before it is still being taken in, else after."""
+        item: Any = message
+        group_id = message.get("media_group_id")
+        if group_id is not None:
+            key = (chat_id, group_id)
+            album = self._albums.get(key)
+            if album is not None:  # more of an album still gathering, already in line
+                album.messages.append(message)
+                album.timer.cancel()
+                album.timer = self._spawn(self._close_album(key, album))
+                return
+            item = self._albums[key] = Album([message])  # in line from its first item, so later texts wait for it
+            item.timer = self._spawn(self._close_album(key, item))
         intake = self._intakes.setdefault(chat_id, Intake())
         if "text" in message and not intake.busy:
             await self._take(chat_id, message)  # a text with nothing before it: at once, as ever
             return
-        intake.queue.put_nowait(message)
+        intake.queue.put_nowait(item)
         if not intake.busy:
             intake.worker = self._spawn(self._take_all(chat_id, intake))
 
@@ -395,20 +419,32 @@ class TelegramBot:
             except Exception:
                 logger.exception("Telegram message in chat %s not taken in", chat_id)
 
-    async def _take(self, chat_id: int, message: Dict[str, Any]) -> None:
+    async def _close_album(self, key: Tuple[int, str], album: Album) -> None:
+        await asyncio.sleep(self.album_seconds)
+        self._albums.pop(key, None)
+        album.complete.set()
+
+    async def _take(self, chat_id: int, item: Any) -> None:
         """
-        A text goes to the agent with the files its sender has waiting. Files are saved in uploads/ first: with a
-        caption they go to the agent with it, without one they wait for their sender's next message.
+        A message, or an album once whole. A text goes to the agent with the files its sender has waiting. Files
+        are saved in uploads/ first: with a caption they go to the agent with it, without one they wait for their
+        sender's next message.
         """
-        messages = [message]
-        first = messages[0]
+        if isinstance(item, Album):
+            await item.complete.wait()
+            messages = item.messages
+        else:
+            messages = [item]
+        first = messages[0]  # an album's sender, and the message a reply answers
         sender, reply = first.get("from") or {}, self._reply(first)
         if "text" in first:
             text = self._signed(first, self._unmention(first["text"])) if is_group(chat_id) else first["text"]
             if text.strip():
                 await self._accept(chat_id, sender, text, [], reply)
             return
-        caption = first.get("caption") or ""
+        if is_group(chat_id) and not any(self._meant_for_me(m) for m in messages):
+            return  # an album none of which is meant for the bot
+        caption = next((m["caption"] for m in messages if m.get("caption")), "")
         if is_group(chat_id):
             caption = self._unmention(caption)  # a caption that only mentions the bot is no text
         text = (self._signed(first, caption) if is_group(chat_id) else caption) if caption.strip() else ""
