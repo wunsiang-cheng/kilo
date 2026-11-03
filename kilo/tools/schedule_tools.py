@@ -28,7 +28,7 @@ SCHEDULE_TOOL_DEFINITION = {
         "awaits approval. 'pause' and 'delete' take effect at once. The list holds every conversation's schedules: "
         "change another conversation's only when the user asks."
     ),
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {
             "action": {

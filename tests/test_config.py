@@ -46,7 +46,7 @@ def test_tests_cannot_see_the_real_env_file():
 
 
 def test_shell_schema_states_the_configured_timeout():
-    timeout = SHELL_TOOL_DEFINITION["input_schema"]["properties"]["timeout"]
+    timeout = SHELL_TOOL_DEFINITION["parameters"]["properties"]["timeout"]
     assert timeout["default"] == settings.kilo_default_timeout
     assert str(settings.kilo_default_timeout) in timeout["description"]
 
@@ -54,7 +54,7 @@ def test_shell_schema_states_the_configured_timeout():
 def test_shell_schema_follows_the_setting():
     code = (
         "from kilo.tools.shell import SHELL_TOOL_DEFINITION as d\n"
-        "print(d['input_schema']['properties']['timeout']['default'])"
+        "print(d['parameters']['properties']['timeout']['default'])"
     )
     package_root = str(Path(kilo.__file__).resolve().parent.parent)  # this copy of Kilo, whatever is installed
     env = {**os.environ, "KILO_DEFAULT_TIMEOUT": "45", "PYTHONPATH": package_root}
