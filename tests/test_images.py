@@ -112,3 +112,24 @@ def test_a_broken_image_raises(tmp_path):
     (tmp_path / "broken.png").write_bytes(b"not an image")
     with pytest.raises(UnidentifiedImageError):
         images.read(tmp_path / "broken.png")
+
+
+def test_a_large_image_is_shrunk_before_it_is_copied(tmp_path, monkeypatch):
+    seen = []
+
+    def watching(function):
+        def watched(picture, *args, **kwargs):
+            seen.append(picture.size)
+            return function(picture, *args, **kwargs)
+        return watched
+
+    monkeypatch.setattr(images.ImageOps, "exif_transpose", watching(images.ImageOps.exif_transpose))
+    monkeypatch.setattr(images, "_flatten", watching(images._flatten))
+    for name, mode in (("big.png", "RGBA"), ("big.jpg", "RGB")):
+        info = images.read(saved(tmp_path / name, Image.new(mode, (3000, 2000), "red")))
+        assert (info.width, info.height, info.shown.width) == (3000, 2000, 2048)
+    exif = Image.Exif()
+    exif[0x0112] = 6
+    info = images.read(saved(tmp_path / "turned.jpg", Image.new("RGB", (3000, 2000), "red"), exif=exif))
+    assert (info.width, info.height, info.shown.height) == (2000, 3000, 2048)
+    assert len(seen) == 6 and max(max(size) for size in seen) <= images.MAX_SIDE

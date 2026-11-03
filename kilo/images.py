@@ -23,6 +23,7 @@ MAX_SIDE = 2048  # providers shrink larger images to about this anyway (measured
 JPEG_QUALITY = 85
 KEEP_DAYS = 30  # stored images unused for longer are deleted; a conversation that still shows one says it is gone
 SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"})
+ORIENTATION = 0x0112  # the EXIF tag saying how the camera was turned
 
 
 @dataclass(frozen=True)
@@ -90,17 +91,31 @@ def store(picture: Image.Image) -> Stored:
     return Stored(name, picture.width, picture.height)
 
 
+def _shrunk(picture: Image.Image) -> Image.Image:
+    """The image at most MAX_SIDE on its long side, made before anything copies it at full size."""
+    if max(picture.size) <= MAX_SIDE:
+        return picture
+    if picture.mode in ("1", "P", "PA"):  # Pillow resizes these by nearest pixel only
+        picture = picture.convert("RGBA")
+    picture.thumbnail((MAX_SIDE, MAX_SIDE), Image.LANCZOS)  # in place, and JPEG decodes at a reduced scale
+    return picture
+
+
 def read(path: Path) -> ImageInfo:
     """
     Open an image file, take its first frame, turn it upright as its EXIF data says, and store it for the model.
+    It is shrunk first: each later step copies it, and copies of a large image at full size can take gigabytes.
     Pillow's errors (not an image, too many pixels, unreadable) are raised as they are.
     """
     with Image.open(path) as picture:
         kind = Image.MIME.get(picture.format or "", "application/octet-stream")
         frames = getattr(picture, "n_frames", 1)
         picture.seek(0)
-        upright = ImageOps.exif_transpose(picture)
-        return ImageInfo(kind, upright.width, upright.height, frames, store(upright))
+        width, height = picture.size
+        if picture.getexif().get(ORIENTATION) in (5, 6, 7, 8):  # turned a quarter: upright, the sides swap
+            width, height = height, width
+        upright = ImageOps.exif_transpose(_shrunk(picture))
+        return ImageInfo(kind, width, height, frames, store(upright))
 
 
 def data_url(file: str) -> Optional[str]:

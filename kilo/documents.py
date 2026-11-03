@@ -23,6 +23,7 @@ import pptx
 import pypdfium2 as pdfium
 from openpyxl.utils import get_column_letter
 from pptx.enum.shapes import MSO_SHAPE_TYPE
+from pptx.oxml.ns import qn as pptx_qn
 from pptx.shapes.picture import Picture
 
 from kilo import images
@@ -214,9 +215,22 @@ def _word_pictures(element: Any) -> List[str]:
     return lines
 
 
+def _in_text_box(paragraph: Any, cell: Any) -> bool:
+    """Whether a paragraph in a cell is in a text box (or drawing) there, which Word stores twice: left out."""
+    for ancestor in paragraph.iterancestors():
+        if ancestor is cell:
+            return False
+        if ancestor.tag in NOT_TEXT:
+            return True
+    return False
+
+
 def _word_cell(cell: Any) -> str:
-    """A table cell's text: its paragraphs (a nested table's included), one per line."""
-    return "\n".join(text for paragraph in cell._tc.iter(W + "p") if (text := _word_text(paragraph)))
+    """A table cell's text: its paragraphs (a nested table's included, a text box's not), one per line."""
+    return "\n".join(
+        text for paragraph in cell._tc.iter(W + "p")
+        if not _in_text_box(paragraph, cell._tc) and (text := _word_text(paragraph))
+    )
 
 
 def _word_blocks(parent: Any) -> Iterator[Any]:
@@ -274,6 +288,9 @@ def _xlsx_lines(path: Path) -> Iterator[str]:
             yield ""
             rows: List[List[str]] = []
             width = 0
+            # The range a sheet says it uses can be wrong (some programs write just "A1"), and openpyxl would read
+            # only that much: read to the end of what is there instead.
+            sheet.reset_dimensions()
             # Rows from 1 and cells from column A, the empty ones before data filled in: positions are addresses.
             for row_number, values in enumerate(sheet.iter_rows(values_only=True), 1):
                 if gathered > MAX_CHARS:
@@ -336,6 +353,9 @@ def _shape_lines(shape: Any) -> List[str]:
 def _pptx_lines(path: Path) -> Iterator[str]:
     """Each slide under its number and title: its shapes in reading order, then its speaker notes."""
     for number, slide in enumerate(pptx.Presentation(str(path)).slides, 1):
+        # Pen strokes (ink) have no text, and python-pptx fails on the whole slide's shapes when one is there.
+        for ink in list(slide._element.iter(pptx_qn("p:contentPart"))):
+            ink.getparent().remove(ink)
         title_shape = slide.shapes.title
         title = ""
         if title_shape is not None and title_shape.has_text_frame:

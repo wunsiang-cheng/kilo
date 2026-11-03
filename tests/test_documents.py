@@ -12,10 +12,11 @@ from docx.oxml.ns import nsdecls
 from docx.shared import Inches
 from pptx.chart.data import CategoryChartData
 from pptx.enum.chart import XL_CHART_TYPE
+from pptx.oxml.xmlchemy import OxmlElement
 from pptx.util import Inches as SlideInches
 
 from kilo import documents, images
-from samples import locked_pdf, pdf, png_bytes, presentation, with_saved_value, word, workbook
+from samples import locked_pdf, pdf, png_bytes, presentation, with_dimension, with_saved_value, word, workbook
 
 pytestmark = pytest.mark.usefixtures("data_dir")
 DAY = 86400
@@ -343,3 +344,47 @@ def test_a_small_page_is_rendered_at_300_dpi_at_most(tmp_path):
 def test_pages_of_a_password_protected_pdf_are_refused(tmp_path):
     with pytest.raises(documents.DocumentError):
         documents.show_pages(locked_pdf(tmp_path / "locked.pdf"), "1")
+
+
+def test_a_sheet_that_states_its_range_wrong_is_read_whole(tmp_path):
+    def build(book):
+        book.active.append(["Name", "Qty"])
+        book.active.append(["Pen", 3])
+        book.active["D4"] = "far"
+
+    assert text_of(with_dimension(workbook(tmp_path / "dimension.xlsx", build), "A1")) == "\n".join([
+        "## Sheet 1: Sheet", "",
+        "|   | A | B | C | D |",
+        "| --- | --- | --- | --- | --- |",
+        "| 1 | Name | Qty |  |  |",
+        "| 2 | Pen | 3 |  |  |",
+        "| 4 |  |  |  | far |", "",
+    ])
+
+
+def test_ink_on_a_slide_is_left_out(tmp_path):
+    def build(deck):
+        slide = deck.slides.add_slide(deck.slide_layouts[5])
+        slide.shapes.title.text = "Annotated"
+        slide.shapes.add_textbox(SlideInches(1), SlideInches(2), SlideInches(3), SlideInches(1)).text_frame.text = "Body"
+        slide.shapes._spTree.append(OxmlElement("p:contentPart"))  # pen strokes, as PowerPoint saves them
+
+    assert text_of(presentation(tmp_path / "ink.pptx", build)) == "## Slide 1: Annotated\n\nBody\n"
+
+
+def test_text_boxes_in_a_table_are_left_out(tmp_path):
+    box = (
+        f'<w:r {nsdecls("w", "wp")} {MC} xmlns:v="urn:schemas-microsoft-com:vml"><mc:AlternateContent>'
+        '<mc:Choice Requires="wps"><w:drawing><wp:anchor><wp:docPr id="7" name="Text Box 7"/>'
+        '<w:txbxContent><w:p><w:r><w:t>BOX</w:t></w:r></w:p></w:txbxContent></wp:anchor></w:drawing></mc:Choice>'
+        '<mc:Fallback><w:pict><v:shape><w:txbxContent><w:p><w:r><w:t>BOX</w:t></w:r></w:p></w:txbxContent>'
+        '</v:shape></w:pict></mc:Fallback>'
+        '</mc:AlternateContent></w:r>'
+    )
+
+    def build(document):
+        cell = document.add_table(rows=1, cols=1).cell(0, 0)
+        cell.text = "cell text"
+        cell.paragraphs[0]._p.append(parse_xml(box))
+
+    assert text_of(word(tmp_path / "table-box.docx", build)) == "| cell text |\n| --- |\n"

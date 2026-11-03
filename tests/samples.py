@@ -2,6 +2,7 @@
 
 import ctypes
 import io
+import re
 import zipfile
 from pathlib import Path
 from typing import Any, Callable
@@ -38,19 +39,33 @@ def workbook(path: Path, build: Callable[[Any], Any]) -> Path:
     return path
 
 
-def with_saved_value(path: Path, formula: str, value: str) -> Path:
-    """The workbook with `value` saved after `formula`, as Excel saves it: openpyxl saves formulas without values."""
+def _rewrite_sheet(path: Path, change: Callable[[bytes], bytes]) -> Path:
+    """The workbook with its first sheet's XML changed by `change` (which must change it)."""
     with zipfile.ZipFile(path) as source:
         entries = {name: source.read(name) for name in source.namelist()}
     sheet = "xl/worksheets/sheet1.xml"
     before = entries[sheet]
-    for empty in ("<v />", "<v></v>"):  # as ElementTree writes it, and as lxml does (openpyxl uses it when installed)
-        entries[sheet] = entries[sheet].replace(f"<f>{formula}</f>{empty}".encode(), f"<f>{formula}</f><v>{value}</v>".encode())
-    assert entries[sheet] != before, f"no formula {formula} without a value in {path.name}"
+    entries[sheet] = change(before)
+    assert entries[sheet] != before, f"{path.name}: the sheet was not changed"
     with zipfile.ZipFile(path, "w") as target:
         for name, data in entries.items():
             target.writestr(name, data)
     return path
+
+
+def with_saved_value(path: Path, formula: str, value: str) -> Path:
+    """The workbook with `value` saved after `formula`, as Excel saves it: openpyxl saves formulas without values."""
+    def change(sheet: bytes) -> bytes:
+        for empty in ("<v />", "<v></v>"):  # as ElementTree writes it, and as lxml does (openpyxl uses it when installed)
+            sheet = sheet.replace(f"<f>{formula}</f>{empty}".encode(), f"<f>{formula}</f><v>{value}</v>".encode())
+        return sheet
+
+    return _rewrite_sheet(path, change)
+
+
+def with_dimension(path: Path, ref: str) -> Path:
+    """The workbook with the range its first sheet says it uses set to `ref`, as some programs write it wrong."""
+    return _rewrite_sheet(path, lambda sheet: re.sub(rb'<dimension ref="[^"]*"\s*/>', f'<dimension ref="{ref}"/>'.encode(), sheet))
 
 
 def presentation(path: Path, build: Callable[[Any], Any]) -> Path:
