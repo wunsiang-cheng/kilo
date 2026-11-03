@@ -5,16 +5,18 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 
 from fakes import text_turn, tool_turn, until
 from kilo.agent.history import history_events
 from kilo.agent.runner import (
-    COMPACTION_INSTRUCTIONS, COMPACTION_RETRY_TOKENS, CONTINUE_AFTER_COMPACTION, INTERRUPTED_TOOL_RESULT, SUMMARY_HEADER,
-    _api_messages,
+    COMPACTION_INSTRUCTIONS, COMPACTION_RETRY_TOKENS, CONTINUE_AFTER_COMPACTION, IMAGE_TOKENS, INTERRUPTED_TOOL_RESULT,
+    MAX_SHOWN_IMAGES, SUMMARY_HEADER, _api_messages,
 )
-from kilo import uploads
+from kilo import images, uploads
 from kilo.config import settings
 from kilo.models.session import Attachment, MessageRole
+from kilo.tools.base import ShownImage, ToolResult
 
 
 async def collect(kilo, session_id, text, **options):
@@ -408,3 +410,126 @@ async def test_the_note_counts_toward_compaction(kilo, model, session, monkeypat
     model.turns.extend([text_turn("the summary"), text_turn("ok")])
     events = await collect(kilo, session.id, "hi", attachments=[PHOTO])
     assert names(events)[:2] == ["compaction_start", "compaction_done"]
+
+
+def picture(label: str, shade: int = 0) -> ShownImage:
+    """An image in the store, as a tool result shows it."""
+    return ShownImage(file=images.store(Image.new("RGB", (8, 8), (shade, 0, 0))).file, label=label)
+
+
+def image_part(shown: ShownImage) -> list:
+    return [
+        {"type": "text", "text": f"[Image: {shown.label}]"},
+        {"type": "image_url", "image_url": {"url": images.data_url(shown.file)}},
+    ]
+
+
+def showing(monkeypatch, kilo, *shown: ShownImage) -> None:
+    """Every tool call succeeds and shows `shown`."""
+    async def run(name, args):
+        return ToolResult(text=json.dumps({"status": "success"}), images=shown)
+    monkeypatch.setattr(kilo.toolbox, "run", run)
+
+
+async def add_turn(kilo, session, call_ids, shown_by_call) -> None:
+    """A stored assistant turn calling `call_ids`, and a stored result for each call in `shown_by_call`."""
+    calls = [{"id": c, "type": "function", "function": {"name": "read_file", "arguments": "{}"}} for c in call_ids]
+    await kilo.db.add_message(session.id, MessageRole.ASSISTANT, payload={"role": "assistant", "content": None, "tool_calls": calls})
+    for call_id, shown in shown_by_call.items():
+        payload = {"role": "tool", "tool_call_id": call_id, "content": "{}", "images": [{"file": s.file, "label": s.label} for s in shown]}
+        await kilo.db.add_message(session.id, MessageRole.TOOL, content="{}", payload=payload)
+
+
+async def test_images_a_tool_shows_are_stored_and_follow_its_result(kilo, model, session, data_dir, monkeypatch):
+    shown = picture("photo.jpg")
+    showing(monkeypatch, kilo, shown)
+    model.turns.extend([tool_turn("c1", "read_file", {"path": "photo.jpg"}), text_turn("a red square")])
+    await collect(kilo, session.id, "look")
+    stored = [m for m in await kilo.db.get_messages(session.id) if m.role == MessageRole.TOOL]
+    assert stored[0].payload["images"] == [{"file": shown.file, "label": "photo.jpg"}]
+    assert [m["role"] for m in model.requests[1]] == ["user", "assistant", "tool", "user"]
+    assert model.requests[1][-1] == {"role": "user", "content": image_part(shown)}
+
+
+async def test_one_message_follows_all_the_results_of_a_turn(kilo, session, data_dir):
+    first, second = picture("a.png", 0), picture("b.png", 200)
+    await kilo.db.add_message(session.id, MessageRole.USER, content="compare")
+    await add_turn(kilo, session, ["c1", "c2"], {"c1": [first], "c2": [second]})
+    messages = _api_messages(await kilo.db.get_messages(session.id))
+    assert [m["role"] for m in messages] == ["user", "assistant", "tool", "tool", "user"]
+    assert messages[-1]["content"] == image_part(first) + image_part(second)
+
+
+async def test_images_follow_the_stand_ins_of_interrupted_calls(kilo, session, data_dir):
+    shown = picture("a.png")
+    await kilo.db.add_message(session.id, MessageRole.USER, content="look")
+    await add_turn(kilo, session, ["c1", "c2"], {"c1": [shown]})
+    messages = _api_messages(await kilo.db.get_messages(session.id))
+    assert messages[-2:] == [interrupted("c2"), {"role": "user", "content": image_part(shown)}]
+
+
+async def test_only_the_last_10_images_are_shown(kilo, session, data_dir):
+    shown = [picture(f"{i}.png", i * 20) for i in range(MAX_SHOWN_IMAGES + 1)]
+    await kilo.db.add_message(session.id, MessageRole.USER, content="look at them all")
+    for i, image in enumerate(shown):
+        await add_turn(kilo, session, [f"c{i}"], {f"c{i}": [image]})
+    messages = _api_messages(await kilo.db.get_messages(session.id))
+    image_messages = [m["content"] for m in messages if m["role"] == "user" and isinstance(m["content"], list)]
+    assert image_messages[0] == [{"type": "text", "text": (
+        "[Image: 0.png. No longer shown, to keep the conversation small; read the file again to see it.]"
+    )}]
+    assert image_messages[1:] == [image_part(image) for image in shown[1:]]
+
+
+async def test_an_image_no_longer_stored_is_described(kilo, session, data_dir):
+    await kilo.db.add_message(session.id, MessageRole.USER, content="look")
+    await add_turn(kilo, session, ["c1"], {"c1": [ShownImage(file="gone.jpg", label="old.png")]})
+    messages = _api_messages(await kilo.db.get_messages(session.id))
+    assert messages[-1] == {"role": "user", "content": [
+        {"type": "text", "text": "[Image: old.png. No longer available; read the file again to see it.]"},
+    ]}
+
+
+async def test_a_model_that_takes_no_images_is_told_instead(kilo, model, session, data_dir, monkeypatch):
+    model.images = False
+    showing(monkeypatch, kilo, picture("photo.jpg"))
+    model.turns.extend([tool_turn("c1", "read_file", {"path": "photo.jpg"}), text_turn("I cannot see it")])
+    await collect(kilo, session.id, "look")
+    assert model.requests[1][-1] == {"role": "user", "content": [
+        {"type": "text", "text": "[Image: photo.jpg. Not shown: the model in use does not take images.]"},
+    ]}
+
+
+async def test_a_conversation_without_images_does_not_ask_the_model(kilo, model, session):
+    model.turns.extend([tool_turn("c1", "glob", {"pattern": "*"}), text_turn("done")])
+    await collect(kilo, session.id, "go")
+    assert model.image_lookups == 0
+
+
+async def test_an_image_counts_toward_compaction(kilo, model, session, data_dir, monkeypatch):
+    monkeypatch.setattr(settings, "kilo_compact_at_tokens", 10_000)
+    showing(monkeypatch, kilo, picture("photo.jpg"))
+    call = tool_turn("c1", "read_file", {"path": "photo.jpg"})
+    call[-1]["context_tokens"] = 10_000 - IMAGE_TOKENS // 2  # below the threshold until the image counts
+    model.turns.extend([call, text_turn("the summary"), text_turn("finished")])
+    assert "compaction_done" in names(await collect(kilo, session.id, "look"))
+
+
+async def test_the_summary_sees_the_images_and_later_requests_do_not(kilo, model, session, data_dir, monkeypatch):
+    shown = picture("photo.jpg")
+    showing(monkeypatch, kilo, shown)
+    model.turns.extend([
+        tool_turn("c1", "read_file", {"path": "photo.jpg"}), text_turn("red"), text_turn("the summary"), text_turn("ok"),
+    ])
+    await collect(kilo, session.id, "look")
+    assert (await kilo.runner.compact(session.id))["event"] == "compaction_done"
+    await collect(kilo, session.id, "and now?")
+    assert {"role": "user", "content": image_part(shown)} in model.requests[2]
+    assert "image_url" not in json.dumps(model.requests[3])
+
+
+def test_a_summary_keeps_what_images_showed():
+    assert (
+        "- What the images and documents read so far showed, where it matters later; "
+        "images are not kept after this summary." in COMPACTION_INSTRUCTIONS
+    )

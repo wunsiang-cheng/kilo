@@ -4,13 +4,14 @@ import asyncio
 import json
 from typing import Any, AsyncGenerator, Dict, List, Optional, Sequence, Tuple
 
-from kilo import uploads, workspace
+from kilo import images, uploads, workspace
 from kilo.config import settings
 from kilo.context import current_session_id
 from kilo.agent.chat_model import ChatModel
 from kilo.models.session import Attachment, MessageRole
 from kilo.storage.db import Database
 from kilo.tools import Toolbox
+from kilo.tools.base import ToolResult
 
 SYSTEM_PROMPT_INTRO = """You are an AI agent, and you need to use your tools to help users perform tasks."""
 
@@ -24,6 +25,7 @@ COMPACTION_INSTRUCTIONS = """Summarize this conversation between a user and Kilo
 - Decisions made and why; constraints and preferences the user stated.
 - Files and directories created, edited or inspected, with exact paths and the state they were left in.
 - Files the user sent, with their paths.
+- What the images and documents read so far showed, where it matters later; images are not kept after this summary.
 - Commands that matter later, with their outcomes; errors not yet resolved.
 - Schedule, run and task ids, and other identifiers in use.
 - What was in progress at the end, and the next steps.
@@ -88,6 +90,14 @@ def _replayable(message: Dict[str, Any]) -> Dict[str, Any]:
 
 INTERRUPTED_TOOL_RESULT = "Tool call was interrupted before it returned a result."
 
+# The images tool results show go to the model in a user message after the results: a tool message takes text only.
+MAX_SHOWN_IMAGES = 10  # the most recent ones; older ones are described instead, to keep each request small
+IMAGE_TOKENS = 4_000  # an image's size until the API measures it (a 2048-pixel image, measured 2026-11-03)
+IMAGE_LABEL = "[Image: {label}]"
+IMAGE_DROPPED = "[Image: {label}. No longer shown, to keep the conversation small; read the file again to see it.]"
+IMAGE_MISSING = "[Image: {label}. No longer available; read the file again to see it.]"
+IMAGE_UNSEEN = "[Image: {label}. Not shown: the model in use does not take images.]"
+
 
 def _user_content(msg: Any) -> str:
     """A stored user message as the model gets it: its text, then where the files sent with it are."""
@@ -95,23 +105,64 @@ def _user_content(msg: Any) -> str:
     return uploads.with_note(msg.content or "", attached)
 
 
-def _api_messages(db_messages: List[Any]) -> List[Dict[str, Any]]:
+def _since_summary(db_messages: List[Any]) -> List[Any]:
+    """The stored messages a request sends: from the latest summary on, as it replaces everything before it."""
+    summaries = [i for i, msg in enumerate(db_messages) if _is_summary(msg)]
+    return db_messages[summaries[-1]:] if summaries else db_messages
+
+
+def _shown_images(msg: Any) -> List[Dict[str, Any]]:
+    """The images a stored tool result shows: {"file", "label"} each."""
+    return ((msg.payload or {}).get("images") or []) if msg.role == MessageRole.TOOL else []
+
+
+def _has_images(db_messages: List[Any]) -> bool:
+    """Whether the history a request sends has images in it."""
+    return any(_shown_images(msg) for msg in _since_summary(db_messages))
+
+
+def _image_parts(image: Dict[str, Any], recent: bool, show_images: bool) -> List[Dict[str, Any]]:
+    """An image shown by a tool result, as content parts of the message after the results: it, or why it is not there."""
+    label = image.get("label", "")
+    if not show_images:
+        return [{"type": "text", "text": IMAGE_UNSEEN.format(label=label)}]
+    if not recent:
+        return [{"type": "text", "text": IMAGE_DROPPED.format(label=label)}]
+    url = images.data_url(image.get("file", ""))
+    if url is None:
+        return [{"type": "text", "text": IMAGE_MISSING.format(label=label)}]
+    return [{"type": "text", "text": IMAGE_LABEL.format(label=label)}, {"type": "image_url", "image_url": {"url": url}}]
+
+
+def _api_messages(db_messages: List[Any], show_images: bool = True) -> List[Dict[str, Any]]:
     """
     Rebuild the Chat Completions history from stored messages. Deterministic, so every request replays an
     identical prefix (the provider's prompt cache keeps hitting, and the reasoning sent back stays valid).
     History starts at the latest summary: it replaces everything before it, which stays stored but is never
     sent again. Each tool result is a tool message of its own; a tool call with no stored result (the run was
     interrupted) gets an error result before the next message, so the history stays valid.
+    The images the tool results of a turn show follow them in one user message (a tool message takes text only):
+    the MAX_SHOWN_IMAGES most recent ones as images, each after its label, the others described; when the model
+    takes no images (`show_images` False), all of them described.
     """
-    summaries = [i for i, msg in enumerate(db_messages) if _is_summary(msg)]
-    if summaries:
-        db_messages = db_messages[summaries[-1]:]
+    db_messages = _since_summary(db_messages)
+    first_recent = sum(len(_shown_images(msg)) for msg in db_messages) - MAX_SHOWN_IMAGES
     messages: List[Dict[str, Any]] = []
     pending: List[str] = []  # calls of the latest assistant turn still without a result
+    turn_images: List[Dict[str, Any]] = []  # images the results of that turn show, in order
+    seen = 0  # images met so far
 
-    def close_pending() -> None:
+    def close_turn() -> None:
         messages.extend({"role": "tool", "tool_call_id": call_id, "content": INTERRUPTED_TOOL_RESULT} for call_id in pending)
         pending.clear()
+        if turn_images:
+            first = seen - len(turn_images)
+            content = [
+                part for number, image in enumerate(turn_images, first)
+                for part in _image_parts(image, number >= first_recent, show_images)
+            ]
+            messages.append({"role": "user", "content": content})
+            turn_images.clear()
 
     for msg in db_messages:
         if msg.role == MessageRole.TOOL:
@@ -119,8 +170,10 @@ def _api_messages(db_messages: List[Any]) -> List[Dict[str, Any]]:
             if call_id in pending:
                 pending.remove(call_id)
             messages.append({"role": "tool", "tool_call_id": call_id, "content": msg.content or ""})
+            turn_images.extend(_shown_images(msg))
+            seen += len(_shown_images(msg))
             continue
-        close_pending()
+        close_turn()
         if msg.role == MessageRole.ASSISTANT:
             if msg.payload is None:
                 messages.append({"role": "assistant", "content": msg.content})
@@ -131,7 +184,7 @@ def _api_messages(db_messages: List[Any]) -> List[Dict[str, Any]]:
             messages.append({"role": "user", "content": f"{SUMMARY_HEADER}\n\n{msg.content or ''}"})
         else:
             messages.append({"role": "user", "content": _user_content(msg)})
-    close_pending()
+    close_turn()
     return messages
 
 
@@ -226,6 +279,11 @@ class AgentRunner:
         """The stored messages a request is built from: from the latest summary on (all of them before one)."""
         return await self.db.get_messages(session_id, since_id=(await self._metadata(session_id)).get("summary_message_id"))
 
+    async def _request_messages(self, session_id: str) -> List[Dict[str, Any]]:
+        """The conversation as the next request sends it; whether the model takes images is asked only if it has some."""
+        history = await self._history(session_id)
+        return _api_messages(history, await self.client.takes_images() if _has_images(history) else True)
+
     async def _metadata(self, session_id: str) -> Dict[str, Any]:
         session = await self.db.get_session(session_id, include_messages=False)
         return session.metadata if session else {}
@@ -245,7 +303,7 @@ class AgentRunner:
         yield {"event": "compaction_start", "data": {"context_tokens": estimate, "manual": manual}}
         # The conversation's own system prompt and tools, so the request reuses the prefix the provider has cached.
         # (Tools cannot be turned off with tool_choice "none": some providers refuse it.)
-        messages = _api_messages(await self._history(session_id)) + [{"role": "user", "content": COMPACTION_INSTRUCTIONS}]
+        messages = await self._request_messages(session_id) + [{"role": "user", "content": COMPACTION_INSTRUCTIONS}]
         try:
             for max_tokens in (settings.kilo_compact_max_tokens, 2 * settings.kilo_compact_max_tokens):
                 final: Optional[Dict[str, Any]] = None
@@ -345,7 +403,7 @@ class AgentRunner:
                     await self.db.add_message(session_id=session_id, role=MessageRole.USER, content=CONTINUE_AFTER_COMPACTION)
                     context, unmeasured = meta.get("context_tokens") or 0, len(CONTINUE_AFTER_COMPACTION)
 
-            llm_messages = _api_messages(await self._history(session_id))
+            llm_messages = await self._request_messages(session_id)
             current_assistant_content = ""
             final: Optional[Dict[str, Any]] = None
 
@@ -417,22 +475,23 @@ class AgentRunner:
                     if finish_reason == "length":
                         # The reply was cut off, so this call's arguments may be incomplete. (Some providers end a
                         # turn of tool calls with "stop", so only a cut-off reply keeps its calls from running.)
-                        result_str = json.dumps({
+                        result = ToolResult(text=json.dumps({
                             "status": "error",
                             "message": f"Not executed: the response stopped ({finish_reason}) before this tool call was complete.",
-                        })
+                        }))
                     elif args_error is None:
                         token = current_session_id.set(session_id)
                         try:
-                            result_str = await self.toolbox.execute(fn_name, args)
+                            result = await self.toolbox.run(fn_name, args)
                         finally:
                             current_session_id.reset(token)
                     else:
                         # Not executed: the model gets the error as this call's result and can retry.
-                        result_str = json.dumps({
+                        result = ToolResult(text=json.dumps({
                             "status": "error",
                             "message": f"Invalid arguments for tool '{fn_name}': {args_error}",
-                        })
+                        }))
+                    result_str = result.text
 
                     # Parse result for structured event emission
                     try:
@@ -440,12 +499,12 @@ class AgentRunner:
                     except Exception:
                         parsed_res = {"raw": result_str}
 
-                    unmeasured += len(result_str)
+                    unmeasured += len(result_str) + len(result.images) * IMAGE_TOKENS * CHARS_PER_TOKEN
+                    payload: Dict[str, Any] = {"role": "tool", "tool_call_id": call_id, "content": result_str}
+                    if result.images:  # sent after the turn's results (see _api_messages)
+                        payload["images"] = [{"file": image.file, "label": image.label} for image in result.images]
                     await self.db.add_message(
-                        session_id=session_id,
-                        role=MessageRole.TOOL,
-                        content=result_str,
-                        payload={"role": "tool", "tool_call_id": call_id, "content": result_str},
+                        session_id=session_id, role=MessageRole.TOOL, content=result_str, payload=payload,
                     )
 
                     yield {

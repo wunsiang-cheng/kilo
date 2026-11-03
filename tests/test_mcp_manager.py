@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from kilo.tools.base import Tool
+from kilo.tools.base import ShownImage, Tool, ToolResult
 from kilo.tools.mcp_manager import MCPError, MCPManager, MCPServerConfig, MCPServerNotFound, MCPServerStatus, expand
 from kilo.tools.mcp_tools import execute_mcp_tool
 from kilo.tools.toolbox import INTENT, Toolbox
@@ -224,3 +224,22 @@ async def test_agent_tool_adds_and_lists_servers(manager):
 async def test_agent_tool_needs_a_name_and_known_action(manager):
     assert json.loads(await execute_mcp_tool(manager, {"action": "add"}))["status"] == "error"
     assert json.loads(await execute_mcp_tool(manager, {"action": "nope", "name": "x"}))["status"] == "error"
+
+
+def tool_returning(result):
+    async def run(args):
+        return result
+    return Tool(definition={"name": "look", "description": "d", "parameters": {"type": "object", "properties": {}}}, execute=run)
+
+
+async def test_run_gives_a_tool_s_text_and_images(manager):
+    image = ShownImage(file="a.jpg", label="photo.jpg")
+    toolbox = Toolbox([tool_returning(ToolResult(text='{"status": "success", "path": "照片.jpg"}', images=(image,)))], manager)
+    result = await toolbox.run("look", {})
+    assert result == ToolResult(text='{"status": "success", "path": "照片.jpg"}', images=(image,))
+    assert await toolbox.execute("look", {}) == result.text
+
+
+async def test_run_takes_a_text_result_as_one_without_images(manager):
+    toolbox = Toolbox([tool_returning('{"status": "success"}')], manager)
+    assert await toolbox.run("look", {}) == ToolResult(text='{"status": "success"}')
