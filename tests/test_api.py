@@ -139,6 +139,85 @@ async def test_unknown_session_404(authed, path):
     assert (await call(f"{API}/sessions/sess_x/{path}", **kwargs)).status_code == 404
 
 
+async def upload(http, data: bytes = b"secret words", name: str = "notes.txt", content_type: str = "text/plain"):
+    return await http.post(f"{API}/uploads", params={"name": name}, content=data, headers={"content-type": content_type})
+
+
+async def test_upload_saves_the_body_as_a_file(authed, workspace):
+    response = await upload(authed)
+    assert response.status_code == 201
+    body = response.json()
+    assert body["path"].startswith("uploads/") and body["path"].endswith("/notes.txt")
+    assert {k: body[k] for k in ("name", "type", "size")} == {"name": "notes.txt", "type": "text/plain", "size": 12}
+    assert (workspace / body["path"]).read_bytes() == b"secret words"
+
+
+@pytest.mark.parametrize("params", [{}, {"name": "  "}])
+async def test_upload_needs_a_name(authed, params):
+    response = await authed.post(f"{API}/uploads", params=params, content=b"x")
+    assert response.status_code == 400 and response.json()["detail"] == "name is required."
+
+
+async def test_upload_needs_login(client):
+    assert (await upload(client)).status_code == 401
+
+
+async def test_upload_over_the_limit_is_refused_unread(authed, workspace, monkeypatch):
+    monkeypatch.setattr(settings, "kilo_upload_max_mb", 1)
+    response = await upload(authed, b"x" * (1024 * 1024 + 1), "big.bin")
+    assert response.status_code == 413
+    assert response.json()["detail"] == "File is larger than the upload limit of 1 MB (KILO_UPLOAD_MAX_MB)."
+    assert not (workspace / "uploads").exists()
+
+
+async def test_upload_without_a_length_is_cut_off_at_the_limit(authed, workspace, monkeypatch):
+    monkeypatch.setattr(settings, "kilo_upload_max_mb", 1)
+
+    async def body():
+        for _ in range(3):
+            yield b"x" * (512 * 1024)
+
+    response = await authed.post(f"{API}/uploads", params={"name": "big.bin"}, content=body())
+    assert response.status_code == 413
+    assert [p for p in (workspace / "uploads").rglob("*") if p.is_file()] == []
+
+
+async def test_upload_reports_a_disk_error(authed, workspace):
+    (workspace / "uploads").write_text("not a folder")
+    response = await upload(authed)
+    assert response.status_code == 500
+    assert response.json()["detail"].startswith("Could not save notes.txt: ")
+
+
+async def test_chat_sends_files_by_their_place_not_their_contents(authed, session_id, model):
+    attachment = (await upload(authed)).json()
+    model.turns.append(text_turn("ok"))
+    reply = (await authed.post(f"{API}/sessions/{session_id}/chat", json={
+        "message": "read this", "attachments": [attachment], "stream": False,
+    })).json()
+    sent = model.requests[0][-1]["content"]
+    assert sent.startswith("read this\n\n[Files sent with this message") and attachment["path"] in sent
+    assert "secret words" not in sent
+    assert reply["events"][0]["data"]["attachments"] == [attachment]
+
+
+async def test_chat_with_only_files(authed, session_id, model):
+    attachment = (await upload(authed)).json()
+    model.turns.append(text_turn("ok"))
+    response = await authed.post(f"{API}/sessions/{session_id}/chat", json={"attachments": [attachment], "stream": False})
+    assert response.status_code == 200
+    assert model.requests[0][-1]["content"].startswith("[Files sent with this message")
+
+
+@pytest.mark.parametrize("path", ["notes.txt", "uploads/2026-11-03/missing.txt"])
+async def test_chat_refuses_files_not_in_uploads(authed, session_id, workspace, kilo, path):
+    (workspace / "notes.txt").write_text("x")
+    response = await authed.post(f"{API}/sessions/{session_id}/chat", json={"message": "hi", "attachments": [{"path": path}]})
+    assert response.status_code == 400
+    assert response.json()["detail"] == f"Attachment '{path}' is not a file in uploads/."
+    assert await kilo.db.get_messages(session_id) == []
+
+
 async def test_stop_says_when_nothing_is_running(authed, session_id):
     assert (await authed.post(f"{API}/sessions/{session_id}/stop")).json() == {"stopped": False}
 
