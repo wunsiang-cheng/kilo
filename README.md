@@ -9,7 +9,7 @@ An autonomous AI agent with an unrestricted shell, scheduled jobs and MCP integr
 
 - **Agent loop**: streams the model's replies and tool calls; sessions persist in SQLite and long conversations are compacted automatically.
 - **Tools**: `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `shell`, `mcp`, `schedule`.
-- **Files**: send any file from the web terminal (`/upload`, drag and drop, or paste) or from Telegram. It is saved in `uploads/` in the workspace, and the agent is told where it is, not given its contents.
+- **Files**: send any file from the web terminal (`/upload`, drag and drop, or paste) or from Telegram. It is saved in `uploads/` in the workspace, and the agent is told where it is, not given its contents. The agent reads it with `read_file`, which shows images to the model and turns PDF, Word, Excel and PowerPoint files into text.
 - **Schedules**: one-off or cron jobs that continue a session when they fire, one per session (a one-off is deleted once it has run). Ask the agent to set them up; each schedule, and each change to one, runs only after you approve it at the prompt (or with the buttons in Telegram).
 - **MCP**: connect stdio or streamable HTTP servers; their tools are offered to the agent alongside the built-in ones.
 - **Telegram (optional)**: a second interface, for the users you list, in private chats and the groups you list.
@@ -55,12 +55,14 @@ The default password is public, so it works only from the local machine, and the
 
 ## Files
 
-Files you send are saved in the workspace under `uploads/<date>/` (the date in `KILO_TIMEZONE`). Their names are kept, except that characters a shell could act on become `_`, and a name already used that day gets `-2`, `-3` and so on. The model never receives a file's contents: the message it came with lists each file's path, type and size, and the agent reads the file with its tools when it needs to. For now `read_file` reads text files only.
+Files you send are saved in the workspace under `uploads/<date>/` (the date in `KILO_TIMEZONE`). Their names are kept, except that characters a shell could act on become `_`, and a name already used that day gets `-2`, `-3` and so on. The model never receives a file's contents: the message it came with lists each file's path, type and size, and the agent reads the file with its tools when it needs to. `read_file` reads text files; images (PNG, JPEG, WebP, GIF, BMP, TIFF), which the model is shown; and PDF, Word (.docx), Excel (.xlsx) and PowerPoint (.pptx) files, as text. A scanned PDF page can be shown as an image instead. The model has to take images to see them (the default model does); otherwise the agent is told it cannot.
 
 - **Web terminal**: `/upload` opens a file chooser; you can also drop files on the page or paste them at the prompt. Each one uploads at once and waits at the prompt (`📎2` means two) until you send your next message, which may be empty. `/upload clear` forgets the files waiting; they stay in `uploads/`.
 - **Telegram**: a file with a caption goes to the agent with the caption. A file without one is saved and goes with your next message, so you can send a photo and then say what to do with it. An album is one message. A Telegram bot can fetch files of up to 20 MB; send larger ones from the web terminal.
 
 `KILO_UPLOAD_MAX_MB` (default 500) caps a file's size. If a proxy is in front of Kilo, raise its request size limit too (nginx's `client_max_body_size` is 1 MB by default). Nothing is deleted automatically: clear old day folders in `uploads/` yourself.
+
+To show an image, Kilo keeps a copy at most 2048 pixels on its long side in `images/` in the data directory (`KILO_DATA_DIR`), and the text of each document it reads in `converted/`; copies unused for 30 days are deleted. Only the 10 most recent images stay in the conversation.
 
 ## MCP servers
 

@@ -39,6 +39,12 @@ class FakeModel:
         self.turns: List[List[Any]] = list(turns or [])
         self.requests: List[List[Dict[str, Any]]] = []  # the messages of each call
         self.max_tokens: List[Optional[int]] = []  # the max_tokens of each call
+        self.images = True  # what takes_images answers
+        self.image_lookups = 0  # how often it was asked
+
+    async def takes_images(self) -> bool:
+        self.image_lookups += 1
+        return self.images
 
     async def stream_turn(
         self, system: str, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]], max_tokens: Optional[int] = None,

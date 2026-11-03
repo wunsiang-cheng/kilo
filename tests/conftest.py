@@ -46,6 +46,15 @@ def workspace(tmp_path, monkeypatch) -> Path:
 
 
 @pytest.fixture
+def data_dir(tmp_path, monkeypatch) -> Path:
+    """KILO_DATA_DIR, for what Kilo keeps there by the settings: saved tool output, images, converted documents."""
+    folder = tmp_path / "data"
+    folder.mkdir()
+    monkeypatch.setattr(settings, "kilo_data_dir", folder)
+    return folder
+
+
+@pytest.fixture
 def model() -> FakeModel:
     return FakeModel()
 

@@ -1,9 +1,9 @@
 """Toolbox: the agent's tool catalog and dispatcher (built-in tools plus live MCP tools)."""
 
 import json
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Union
 
-from kilo.tools.base import Tool
+from kilo.tools.base import Tool, ToolResult
 from kilo.tools.mcp_manager import MCP_TOOL_PREFIX, MCPManager
 from kilo.tools.output_limit import limit_output
 
@@ -74,16 +74,24 @@ class Toolbox:
         """The canonical name for a built-in tool alias; any other name is returned unchanged."""
         return self._names.get(name, name)
 
-    async def execute(self, name: str, args: Dict[str, Any]) -> str:
+    async def run(self, name: str, args: Dict[str, Any]) -> ToolResult:
         """
-        Execute a tool by name or alias and return its JSON string result, as the model will see it:
-        within KILO_TOOL_OUTPUT_MAX_CHARS (see `limit_output`). The call's `intent` is not passed on to the tool.
+        Execute a tool by name or alias and return its result as the model will see it: the JSON text within
+        KILO_TOOL_OUTPUT_MAX_CHARS (see `limit_output`), and the images it shows. The call's `intent` is not passed
+        on to the tool.
         """
         if INTENT in args and not self._has_own_intent(name):
             args = {key: value for key, value in args.items() if key != INTENT}
-        return limit_output(name, await self._execute(name, args))
+        result = await self._execute(name, args)
+        if isinstance(result, str):
+            result = ToolResult(text=result)
+        return ToolResult(text=limit_output(name, result.text), images=result.images)
 
-    async def _execute(self, name: str, args: Dict[str, Any]) -> str:
+    async def execute(self, name: str, args: Dict[str, Any]) -> str:
+        """Execute a tool as `run` does, and return only its text."""
+        return (await self.run(name, args)).text
+
+    async def _execute(self, name: str, args: Dict[str, Any]) -> Union[str, ToolResult]:
         if name.startswith(MCP_TOOL_PREFIX) and self._mcp.has_tool(name):
             try:
                 return json.dumps(await self._mcp.call_tool(name, args), default=str)

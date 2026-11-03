@@ -6,13 +6,29 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List
 
-from kilo import workspace
+from kilo import documents, images, workspace
 from kilo.config import settings
-from kilo.tools.base import Tool
+from kilo.tools.base import ShownImage, Tool, ToolResult
 from kilo.tools.output_limit import clip_line
 
 MAX_LINE_CHARS = 2000  # longer lines are cut, with a marker giving their length
 READ_FILE_ROOM = 2000  # characters of the output limit kept for the result's other fields
+
+HEIC_SUFFIXES = frozenset({".heic", ".heif"})
+OLD_OFFICE_SUFFIXES = frozenset({".doc", ".xls", ".ppt"})
+HEIC_MESSAGE = "HEIC images are not supported. Ask for a JPEG or PNG instead."
+OLD_OFFICE_MESSAGE = (
+    "Old Office formats (.doc, .xls, .ppt) are not supported. Ask for .docx, .xlsx or .pptx instead, "
+    "or convert the file with LibreOffice (soffice) if it is installed."
+)
+BINARY_MESSAGE = (
+    "File '{path}' appears to be binary ({size} bytes). read_file reads text files, images (PNG, JPEG, WebP, GIF, "
+    "BMP, TIFF), PDF, Word (.docx), Excel (.xlsx) and PowerPoint (.pptx) files."
+)
+PAGES_PDF_ONLY = "pages applies to PDF files only."
+SHOWN_IMAGE_MESSAGE = "The image is shown in the message after the tool results."
+SHOWN_FRAMES_MESSAGE = "The first of its {frames} frames is shown in the message after the tool results."
+SHOWN_PAGES_MESSAGE = "The pages are shown as images in the message after the tool results."
 
 
 def _is_binary_file(file_path: Path) -> bool:
@@ -28,10 +44,14 @@ def _is_binary_file(file_path: Path) -> bool:
 READ_FILE_TOOL_DEFINITION = {
     "name": "read_file",
     "description": (
-        "Read a text file. Each line comes with its number and ' | ' in front (e.g. '   12 | text'), which are not part "
-        "of the file. Lines longer than 2,000 characters are cut, with a marker, and a long read stops early with "
-        "`truncated` and a `message` saying where to continue. Bytes that are not UTF-8 show as replacement characters. "
-        "Binary files are refused."
+        "Read a file. Text comes as numbered lines: each line with its number and ' | ' in front (e.g. '   12 | text'), "
+        "which are not part of the file. Lines longer than 2,000 characters are cut, with a marker, and a long read "
+        "stops early with `truncated` and a `message` saying where to continue. Bytes that are not UTF-8 show as "
+        "replacement characters. PDF, Word (.docx), Excel (.xlsx) and PowerPoint (.pptx) files are converted to "
+        "Markdown text, numbered and read in parts the same way; the result's `text_file` holds the whole text, for "
+        "grep. Editing that text does not change the original file. Images (PNG, JPEG, WebP, GIF, BMP, TIFF) are shown "
+        "to you in a message after the tool results, as are PDF pages asked for with `pages`. Other binary files are "
+        "refused."
     ),
     "parameters": {
         "type": "object",
@@ -53,6 +73,13 @@ READ_FILE_TOOL_DEFINITION = {
                 "type": "integer",
                 "description": "Maximum number of lines to return (default: 2000).",
                 "default": 2000,
+            },
+            "pages": {
+                "type": "string",
+                "description": (
+                    'PDF only: pages to look at as images rather than read as text, e.g. "3", "3-5" or "1,4"; at most 5. '
+                    "For scanned pages, and for charts and layouts the text leaves out."
+                ),
             },
         },
         "required": ["path"],
@@ -125,103 +152,160 @@ EDIT_FILE_TOOL_DEFINITION = {
 }
 
 
-def _read_file(args: Dict[str, Any]) -> str:
-    """Execute read_file tool and return JSON string result."""
+def _error(message: str) -> ToolResult:
+    return ToolResult(text=json.dumps({"status": "error", "message": message}))
+
+
+def _numbered(text: str, args: Dict[str, Any], head: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    The lines of `text` a read asks for (start_line, end_line, max_lines), numbered, after the fields in `head`.
+    The read stops early, at a whole line the next read can follow, before the output limit.
+    """
+    all_lines = text.splitlines(keepends=False)
+    total_lines = len(all_lines)
+
+    start_line = int(args.get("start_line", 1) or 1)
+    start_line = max(1, start_line)
+
+    end_line_arg = args.get("end_line")
+    if end_line_arg is not None:
+        end_line = int(end_line_arg)
+    else:
+        end_line = total_lines
+
+    max_lines = int(args.get("max_lines", 2000) or 2000)
+    max_lines = max(1, max_lines)
+
+    if start_line > total_lines:
+        return {
+            **head,
+            "total_lines": total_lines,
+            "start_line": start_line,
+            "end_line": end_line,
+            "lines_returned": 0,
+            "content": "",
+            "message": f"start_line ({start_line}) is greater than total lines ({total_lines}).",
+        }
+
+    # Slice 0-based
+    start_idx = start_line - 1
+    end_idx = min(end_line, total_lines)
+    if end_idx < start_idx:
+        end_idx = start_idx
+
+    sliced = all_lines[start_idx:end_idx]
+    truncated = len(sliced) > max_lines
+    sliced = sliced[:max_lines]
+
+    # Stop before the output limit, so the result ends on a whole line the next read can follow.
+    numbered: List[str] = []
+    size, budget = 0, settings.kilo_tool_output_max_chars - READ_FILE_ROOM
+    for line_no, line in enumerate(sliced, start=start_line):
+        entry = f"{line_no:5d} | {clip_line(line, MAX_LINE_CHARS)}"
+        if numbered and size + len(entry) + 1 > budget:
+            truncated = True
+            break
+        numbered.append(entry)
+        size += len(entry) + 1
+
+    actual_end_line = start_idx + len(numbered)
+    result: Dict[str, Any] = {
+        **head,
+        "total_lines": total_lines,
+        "start_line": start_line,
+        "end_line": actual_end_line,
+        "lines_returned": len(numbered),
+        "truncated": truncated,
+        "content": "\n".join(numbered),
+    }
+    if truncated:
+        result["message"] = f"Not the whole range: continue with start_line={actual_end_line + 1}."
+    return result
+
+
+def _read_image(file_path: Path, path_raw: str) -> ToolResult:
+    """An image, shown to the model after the tool results, and what it is."""
+    try:
+        info = images.read(file_path)
+    except Exception as e:
+        return _error(f"Could not read '{path_raw}' as an image: {e}")
+    shown_as = workspace.display(file_path)
+    result: Dict[str, Any] = {
+        "status": "success", "path": shown_as, "type": info.type, "width": info.width, "height": info.height,
+        "shown_width": info.shown.width, "shown_height": info.shown.height, "message": SHOWN_IMAGE_MESSAGE,
+    }
+    if info.frames > 1:
+        result["frames"] = info.frames
+        result["message"] = SHOWN_FRAMES_MESSAGE.format(frames=info.frames)
+    return ToolResult(text=json.dumps(result), images=(ShownImage(info.shown.file, shown_as),))
+
+
+def _read_document(file_path: Path, path_raw: str, kind: documents.Kind, args: Dict[str, Any], pages: str) -> ToolResult:
+    """A document's converted text, read like a text file's; or the PDF pages `pages` names, shown as images."""
+    shown_as = workspace.display(file_path)
+    try:
+        if pages:
+            total, shown = documents.show_pages(file_path, pages)
+            result = {
+                "status": "success", "path": shown_as, "total_pages": total, "pages": [number for number, _ in shown],
+                "message": SHOWN_PAGES_MESSAGE,
+            }
+            return ToolResult(
+                text=json.dumps(result),
+                images=tuple(ShownImage(stored.file, f"{shown_as}, page {number}") for number, stored in shown),
+            )
+        converted = documents.convert(file_path)
+        text = converted.read_text(encoding="utf-8")
+    except documents.DocumentError as e:
+        return _error(f"'{path_raw}' {e}")
+    except documents.PagesError as e:
+        return _error(str(e))
+    except Exception as e:
+        return _error(f"Could not read '{path_raw}' as {kind.described}: {e}")
+    head = {"status": "success", "path": shown_as, "converted_from": kind.name, "text_file": workspace.display(converted)}
+    return ToolResult(text=json.dumps(_numbered(text, args, head)))
+
+
+def _read_file(args: Dict[str, Any]) -> ToolResult:
+    """Execute read_file: a text file's lines, a document's text, or an image (PDF pages) shown to the model."""
     path_raw = args.get("path")
     if not path_raw:
-        return json.dumps({"status": "error", "message": "Missing required parameter 'path'."})
+        return _error("Missing required parameter 'path'.")
 
     try:
         file_path = workspace.resolve(str(path_raw))
         if not file_path.exists():
-            return json.dumps({
-                "status": "error",
-                "message": f"File not found: '{path_raw}' (resolved: '{file_path}').",
-            })
+            return _error(f"File not found: '{path_raw}' (resolved: '{file_path}').")
         if not file_path.is_file():
-            return json.dumps({
-                "status": "error",
-                "message": f"Path is not a regular file: '{path_raw}'.",
-            })
+            return _error(f"Path is not a regular file: '{path_raw}'.")
+
+        suffix = file_path.suffix.lower()
+        kind = documents.kind_of(file_path)
+        pages = "" if args.get("pages") is None else str(args["pages"]).strip()  # a model may send a number
+        if pages and (kind is None or kind.name != "pdf"):
+            return _error(PAGES_PDF_ONLY)
+        if suffix in images.SUFFIXES:
+            return _read_image(file_path, str(path_raw))
+        if suffix in HEIC_SUFFIXES:
+            return _error(HEIC_MESSAGE)
+        if suffix in OLD_OFFICE_SUFFIXES:
+            return _error(OLD_OFFICE_MESSAGE)
+        if kind is not None:
+            return _read_document(file_path, str(path_raw), kind, args, pages)
 
         if _is_binary_file(file_path):
-            size = file_path.stat().st_size
-            return json.dumps({
-                "status": "error",
-                "message": f"File '{path_raw}' appears to be binary ({size} bytes). Text reading not supported.",
-            })
+            return _error(BINARY_MESSAGE.format(path=path_raw, size=file_path.stat().st_size))
 
         # Read file with UTF-8 encoding
         try:
             content = file_path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             content = file_path.read_text(encoding="utf-8", errors="replace")
-
-        all_lines = content.splitlines(keepends=False)
-        total_lines = len(all_lines)
-
-        start_line = int(args.get("start_line", 1) or 1)
-        start_line = max(1, start_line)
-
-        end_line_arg = args.get("end_line")
-        if end_line_arg is not None:
-            end_line = int(end_line_arg)
-        else:
-            end_line = total_lines
-
-        max_lines = int(args.get("max_lines", 2000) or 2000)
-        max_lines = max(1, max_lines)
-
-        if start_line > total_lines:
-            return json.dumps({
-                "status": "success",
-                "path": workspace.display(file_path),
-                "total_lines": total_lines,
-                "start_line": start_line,
-                "end_line": end_line,
-                "lines_returned": 0,
-                "content": "",
-                "message": f"start_line ({start_line}) is greater than total lines ({total_lines}).",
-            })
-
-        # Slice 0-based
-        start_idx = start_line - 1
-        end_idx = min(end_line, total_lines)
-        if end_idx < start_idx:
-            end_idx = start_idx
-
-        sliced = all_lines[start_idx:end_idx]
-        truncated = len(sliced) > max_lines
-        sliced = sliced[:max_lines]
-
-        # Stop before the output limit, so the result ends on a whole line the next read can follow.
-        numbered: List[str] = []
-        size, budget = 0, settings.kilo_tool_output_max_chars - READ_FILE_ROOM
-        for line_no, line in enumerate(sliced, start=start_line):
-            entry = f"{line_no:5d} | {clip_line(line, MAX_LINE_CHARS)}"
-            if numbered and size + len(entry) + 1 > budget:
-                truncated = True
-                break
-            numbered.append(entry)
-            size += len(entry) + 1
-
-        actual_end_line = start_idx + len(numbered)
-        result: Dict[str, Any] = {
-            "status": "success",
-            "path": workspace.display(file_path),
-            "total_lines": total_lines,
-            "start_line": start_line,
-            "end_line": actual_end_line,
-            "lines_returned": len(numbered),
-            "truncated": truncated,
-            "content": "\n".join(numbered),
-        }
-        if truncated:
-            result["message"] = f"Not the whole range: continue with start_line={actual_end_line + 1}."
-        return json.dumps(result)
+        head = {"status": "success", "path": workspace.display(file_path)}
+        return ToolResult(text=json.dumps(_numbered(content, args, head)))
 
     except Exception as e:
-        return json.dumps({"status": "error", "message": f"Failed to read file '{path_raw}': {str(e)}"})
+        return _error(f"Failed to read file '{path_raw}': {str(e)}")
 
 
 def _write_file(args: Dict[str, Any]) -> str:
@@ -379,7 +463,7 @@ def _edit_file(args: Dict[str, Any]) -> str:
 
 
 # File work runs in a thread, so a large file does not stall the server (other sessions, schedules, Esc).
-async def execute_read_file_tool(args: Dict[str, Any]) -> str:
+async def execute_read_file_tool(args: Dict[str, Any]) -> ToolResult:
     return await asyncio.to_thread(_read_file, args)
 
 
