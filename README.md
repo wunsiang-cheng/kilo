@@ -1,13 +1,13 @@
 # Kilo
 
-An autonomous AI agent, powered by Claude, with an unrestricted shell, scheduled jobs and MCP integrations. You talk to it through a web terminal served by a single FastAPI process, or through a Telegram bot.
+An autonomous AI agent with an unrestricted shell, scheduled jobs and MCP integrations, running on any model [OpenRouter](https://openrouter.ai) offers. You talk to it through a web terminal served by a single FastAPI process, or through a Telegram bot.
 
 > [!WARNING]
 > Kilo runs shell commands with your user's full permissions, with no sandbox and no approval step. Anyone who logs in, or is allowed to talk to its Telegram bot, controls that shell. Run it on a machine or in a container you are willing to hand over.
 
 ## Features
 
-- **Agent loop**: streams Claude's replies and tool calls; sessions persist in SQLite and long conversations are compacted automatically.
+- **Agent loop**: streams the model's replies and tool calls; sessions persist in SQLite and long conversations are compacted automatically.
 - **Tools**: `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `shell`, `mcp`, `schedule`.
 - **Schedules**: one-off or cron jobs that continue a session when they fire, one per session (a one-off is deleted once it has run). Ask the agent to set them up; each schedule, and each change to one, runs only after you approve it at the prompt (or with the buttons in Telegram).
 - **MCP**: connect stdio or streamable HTTP servers; their tools are offered to the agent alongside the built-in ones.
@@ -16,7 +16,7 @@ An autonomous AI agent, powered by Claude, with an unrestricted shell, scheduled
 
 ## Quick start
 
-Requires Python 3.11+, [uv](https://docs.astral.sh/uv/) and Anthropic API credentials.
+Requires Python 3.11+, [uv](https://docs.astral.sh/uv/) and an [OpenRouter API key](https://openrouter.ai/settings/keys).
 
 ```bash
 uv sync
@@ -26,7 +26,7 @@ uv sync
 cp .env.example .env
 ```
 
-Set `ANTHROPIC_API_KEY` in `.env`, or leave it unset to use the SDK's own credential lookup. Then start the server from the project folder:
+Set `OPENROUTER_API_KEY` in `.env`; the server will not start without it. Then start the server from the project folder:
 
 ```bash
 uv run kilo-server
@@ -40,7 +40,8 @@ Settings come from the environment or from `.env` in the directory you start Kil
 
 | Variable | Purpose |
 | --- | --- |
-| `ANTHROPIC_MODEL`, `ANTHROPIC_EFFORT` | Model and effort level |
+| `OPENROUTER_MODEL`, `OPENROUTER_REASONING_EFFORT` | Model (any OpenRouter model id) and reasoning effort |
+| `KILO_COMPACT_AT_TOKENS` | Conversation size (tokens) that triggers a summary; keep it well below the model's context length |
 | `KILO_USERNAME`, `KILO_PASSWORD` | The web terminal's only user |
 | `KILO_HOST`, `KILO_PORT` | Listen address |
 | `KILO_WORKSPACE` | The agent's working directory |

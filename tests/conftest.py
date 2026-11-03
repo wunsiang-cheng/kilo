@@ -1,6 +1,6 @@
 """
 Shared fixtures. Settings are read when `kilo.config` is imported, from the environment and from `.env` in
-the current directory, so this file imports them from an empty folder with no ANTHROPIC_, OPENROUTER_ or KILO_ variables:
+the current directory, so this file imports them from an empty folder with no OPENROUTER_ or KILO_ variables:
 nothing here can read the real `.env` or touch the real data directory or workspace.
 """
 
@@ -12,7 +12,7 @@ from pathlib import Path
 _sandbox = Path(tempfile.mkdtemp(prefix="kilo-tests-"))
 _start_dir = os.getcwd()
 os.chdir(_sandbox)
-for _name in [n for n in os.environ if n.startswith(("ANTHROPIC_", "KILO_", "OPENROUTER_"))]:
+for _name in [n for n in os.environ if n.startswith(("KILO_", "OPENROUTER_"))]:
     del os.environ[_name]
 os.environ["KILO_WORKSPACE"] = str(_sandbox / "ws")
 
