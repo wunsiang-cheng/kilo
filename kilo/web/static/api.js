@@ -14,7 +14,11 @@ const enc = encodeURIComponent;
 
 async function request(method, path, body, signal) {
   const init = { method, headers: {}, signal, credentials: "same-origin" };
-  if (body !== undefined) {
+  if (body instanceof Blob) {
+    // A file goes as it is: the server writes it to disk as it arrives (kilo/server/routes/uploads.py).
+    init.headers["content-type"] = body.type || "application/octet-stream";
+    init.body = body;
+  } else if (body !== undefined) {
     init.headers["content-type"] = "application/json";
     init.body = JSON.stringify(body);
   }
@@ -100,13 +104,17 @@ export const api = {
   // events; the browser reconnects after a dropped connection).
   notices: () => new EventSource("/api/v1/notices"),
 
+  // One file, saved in uploads/ in the workspace; returns where it went, to attach to a message.
+  upload: async (file) => (await request("POST", withQuery("/api/v1/uploads", { name: file.name }), file)).json(),
+
   mcpServers: () => get("/api/v1/mcp/servers"),
   mcpTools: (name) => get(`/api/v1/mcp/servers/${enc(name)}/tools`),
 
-  // The chat's events as the server streams them. Aborting `signal` closes the stream,
-  // and the server then stops the agent's reply.
-  async *chat(sessionId, message, signal) {
-    const response = await request("POST", `/api/v1/sessions/${enc(sessionId)}/chat`, { message, stream: true }, signal);
+  // The chat's events as the server streams them, for a message and the uploads attached to it. Aborting
+  // `signal` closes the stream, and the server then stops the agent's reply.
+  async *chat(sessionId, message, attachments, signal) {
+    const body = { message, attachments, stream: true };
+    const response = await request("POST", `/api/v1/sessions/${enc(sessionId)}/chat`, body, signal);
     const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
     let buffer = "";
     for (;;) {
