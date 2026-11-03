@@ -13,17 +13,19 @@ import uuid
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import docx
 import docx.table
 import docx.text.paragraph
 import openpyxl
 import pptx
+import pypdfium2 as pdfium
 from openpyxl.utils import get_column_letter
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.shapes.picture import Picture
 
+from kilo import images
 from kilo.config import settings
 
 STORE = "converted"
@@ -31,11 +33,19 @@ MAX_CHARS = 10_000_000  # a document's text stops here
 MAX_UNZIPPED_BYTES = 1024**3  # an Office file larger than this unzipped is not opened (a zip bomb, or near enough)
 KEEP_DAYS = 30  # converted texts unused for longer are deleted; reading the document again makes its text again
 CONVERTER_VERSION = 1  # part of each text's name: a new version converts every document anew
+MAX_PAGES_SHOWN = 5  # PDF pages shown as images in one call
+PAGE_DPI_LIMIT = 300  # a small page is not rendered sharper than this
 
 # Each completes the sentence "'<path>' ..." (read_file says which file).
 OLE_CONTAINER = "is password-protected or in an old Office format, so it cannot be read."
 TOO_LARGE_UNZIPPED = "would take more than 1 GB unzipped, so it was not read."
+PASSWORD_PROTECTED = "is password-protected, so it cannot be read."
 STOPPED = "[Conversion stopped here: the text passed {limit:,} characters. The rest of the file is not included.]"
+NO_TEXT = '[No text on this page: it may be a scan or a picture. To see it, read it as an image with pages="{page}".]'
+# The whole error, when a `pages` argument names no pages to show.
+BAD_PAGES = 'pages must be page numbers or ranges, like "3", "3-5" or "1,4".'
+OUT_OF_RANGE = "Page {page} is out of range: the PDF has {total} pages."
+TOO_MANY_PAGES = "At most 5 pages can be shown at once; ask for the others in another call."
 
 # An encrypted Office file is an OLE compound file, as the old binary formats are, not a zip.
 OLE_MAGIC = bytes.fromhex("D0CF11E0A1B11AE1")
@@ -51,6 +61,10 @@ NOT_TEXT = frozenset({W + "pPr", W + "rPr", W + "drawing", W + "pict", MC + "Alt
 
 class DocumentError(Exception):
     """A document that cannot be read, for a reason the model is told; the message completes "'<path>' ..."."""
+
+
+class PagesError(ValueError):
+    """A `pages` argument that names no pages to show; the message is the whole error for the model."""
 
 
 @dataclass(frozen=True)
@@ -340,10 +354,90 @@ def _pptx_lines(path: Path) -> Iterator[str]:
         yield ""
 
 
+# PDF
+
+
+def _open_pdf(path: Path) -> pdfium.PdfDocument:
+    try:
+        return pdfium.PdfDocument(str(path))
+    except pdfium.PdfiumError as e:
+        if "password" in str(e).lower():
+            raise DocumentError(PASSWORD_PROTECTED) from None
+        raise
+
+
+def _pdf_lines(path: Path) -> Iterator[str]:
+    """Each page's text under its number; a page without any says how to look at it instead."""
+    document = _open_pdf(path)
+    try:
+        for number in range(1, len(document) + 1):
+            page = document[number - 1]
+            try:
+                textpage = page.get_textpage()
+                try:
+                    text = textpage.get_text_bounded()
+                finally:
+                    textpage.close()
+            finally:
+                page.close()
+            lines = [line.rstrip() for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+            while lines and not lines[-1]:
+                lines.pop()
+            while lines and not lines[0]:
+                lines.pop(0)
+            yield f"## Page {number}"
+            yield ""
+            yield from lines or [NO_TEXT.format(page=number)]
+            yield ""
+    finally:
+        document.close()
+
+
+def page_numbers(spec: str, total: int) -> List[int]:
+    """The pages a `pages` argument names ("3", "3-5", "1,4"), in its order without repeats; else PagesError."""
+    numbers: List[int] = []
+    for part in re.sub(r"\s+", "", spec).split(","):
+        match = re.fullmatch(r"(\d+)(?:-(\d+))?", part)
+        if match is None or int(match[1]) > int(match[2] or match[1]):
+            raise PagesError(BAD_PAGES)
+        for page in range(int(match[1]), int(match[2] or match[1]) + 1):
+            if not 1 <= page <= total:
+                raise PagesError(OUT_OF_RANGE.format(page=page, total=total))
+            if page not in numbers:
+                numbers.append(page)
+                if len(numbers) > MAX_PAGES_SHOWN:
+                    raise PagesError(TOO_MANY_PAGES)
+    return numbers
+
+
+def show_pages(path: Path, spec: str) -> Tuple[int, List[Tuple[int, images.Stored]]]:
+    """
+    The pages of a PDF that `spec` names, rendered into the image store: MAX_SIDE on their long side, and no sharper
+    than PAGE_DPI_LIMIT. Returns the PDF's page count and each page's number and stored image.
+    """
+    document = _open_pdf(path)
+    try:
+        total = len(document)
+        shown: List[Tuple[int, images.Stored]] = []
+        for number in page_numbers(spec, total):
+            page = document[number - 1]
+            try:
+                width, height = page.get_size()
+                bitmap = page.render(scale=min(images.MAX_SIDE / max(width, height), PAGE_DPI_LIMIT / 72))
+                # Stored while the bitmap lives: the image made of it may share its memory.
+                shown.append((number, images.store(bitmap.to_pil())))
+            finally:
+                page.close()
+        return total, shown
+    finally:
+        document.close()
+
+
 KINDS: Dict[str, Kind] = {
     ".docx": Kind("docx", "a Word document", _docx_lines, zipped=True),
     ".xlsx": Kind("xlsx", "an Excel workbook", _xlsx_lines, zipped=True),
     ".pptx": Kind("pptx", "a PowerPoint presentation", _pptx_lines, zipped=True),
+    ".pdf": Kind("pdf", "a PDF", _pdf_lines, zipped=False),
 }
 
 

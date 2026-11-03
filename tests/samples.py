@@ -1,5 +1,6 @@
 """Files of the kinds read_file reads, made on the spot, so the repository holds no binary test files."""
 
+import ctypes
 import io
 import zipfile
 from pathlib import Path
@@ -8,7 +9,10 @@ from typing import Any, Callable
 import docx
 import openpyxl
 import pptx
+import pypdfium2 as pdfium
+import pypdfium2.raw as pdfium_c
 from PIL import Image
+from pypdf import PdfWriter
 
 
 def png_bytes(color: str = "red") -> io.BytesIO:
@@ -54,4 +58,31 @@ def presentation(path: Path, build: Callable[[Any], Any]) -> Path:
     deck = pptx.Presentation()
     build(deck)
     deck.save(str(path))
+    return path
+
+
+def pdf(path: Path, *texts: str, size=(595, 842)) -> Path:
+    """A PDF with a page per text, in Helvetica; an empty text makes a page with no text at all, as a scan has."""
+    document = pdfium.PdfDocument.new()
+    for text in texts:
+        page = document.new_page(*size)
+        if text:
+            font = pdfium_c.FPDFText_LoadStandardFont(document.raw, b"Helvetica")
+            line = pdfium_c.FPDFPageObj_CreateTextObj(document.raw, font, 24)
+            pdfium_c.FPDFText_SetText(line, (ctypes.c_ushort * (len(text) + 1))(*map(ord, text), 0))
+            pdfium_c.FPDFPageObj_Transform(line, 1, 0, 0, 1, 36, size[1] - 60)
+            pdfium_c.FPDFPage_InsertObject(page.raw, line)
+            page.gen_content()
+    with open(path, "wb") as file:
+        document.save(file)
+    return path
+
+
+def locked_pdf(path: Path) -> Path:
+    """A PDF that opens only with a password."""
+    writer = PdfWriter()
+    writer.add_blank_page(200, 200)
+    writer.encrypt("secret", algorithm="RC4-128")
+    with open(path, "wb") as file:
+        writer.write(file)
     return path

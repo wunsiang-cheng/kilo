@@ -21,6 +21,7 @@ dependencies = [
     "openpyxl>=3.1.5",
     "defusedxml>=0.7.1",
     "python-pptx>=1.0.2",
+    "pypdfium2>=5.0",
 ]
 
 [project.scripts]
@@ -41,6 +42,7 @@ markers = ["live: calls the real OpenRouter API (needs credentials)"]
 
 [dependency-groups]
 dev = [
+    "pypdf>=6.0",
     "pytest>=9.2.0",
     "pytest-asyncio>=1.4.1",
     "pytest-cov>=7.1.0",

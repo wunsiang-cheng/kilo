@@ -14,8 +14,8 @@ from pptx.chart.data import CategoryChartData
 from pptx.enum.chart import XL_CHART_TYPE
 from pptx.util import Inches as SlideInches
 
-from kilo import documents
-from samples import png_bytes, presentation, with_saved_value, word, workbook
+from kilo import documents, images
+from samples import locked_pdf, pdf, png_bytes, presentation, with_saved_value, word, workbook
 
 pytestmark = pytest.mark.usefixtures("data_dir")
 DAY = 86400
@@ -290,3 +290,56 @@ def test_slides_follow_one_another(tmp_path):
             deck.slides.add_slide(deck.slide_layouts[5]).shapes.title.text = title
 
     assert text_of(presentation(tmp_path / "two.pptx", build)) == "## Slide 1: One\n\n## Slide 2: Two\n"
+
+
+TOO_MANY = "At most 5 pages can be shown at once; ask for the others in another call."
+BAD = 'pages must be page numbers or ranges, like "3", "3-5" or "1,4".'
+
+
+def test_a_pdf_has_a_section_per_page(tmp_path):
+    assert text_of(pdf(tmp_path / "doc.pdf", "Hello page one", "")) == "\n".join([
+        "## Page 1", "", "Hello page one", "",
+        "## Page 2", "", '[No text on this page: it may be a scan or a picture. To see it, read it as an image with pages="2".]', "",
+    ])
+
+
+def test_a_password_protected_pdf_is_refused(tmp_path):
+    with pytest.raises(documents.DocumentError) as error:
+        documents.convert(locked_pdf(tmp_path / "locked.pdf"))
+    assert str(error.value) == "is password-protected, so it cannot be read."
+
+
+@pytest.mark.parametrize("spec,expected", [
+    ("3", [3]), ("2-4", [2, 3, 4]), ("1, 4", [1, 4]), ("1-2,7", [1, 2, 7]), ("4,4,2", [4, 2]), (" 5 ", [5]),
+])
+def test_page_numbers(spec, expected):
+    assert documents.page_numbers(spec, 10) == expected
+
+
+@pytest.mark.parametrize("spec,message", [
+    ("", BAD), ("three", BAD), ("5-3", BAD), ("1;2", BAD),
+    ("0", "Page 0 is out of range: the PDF has 10 pages."),
+    ("9-11", "Page 11 is out of range: the PDF has 10 pages."),
+    ("1-6", TOO_MANY),
+])
+def test_page_numbers_that_cannot_be_shown(spec, message):
+    with pytest.raises(documents.PagesError) as error:
+        documents.page_numbers(spec, 10)
+    assert str(error.value) == message
+
+
+def test_pages_are_shown_as_images_2048_on_their_long_side(tmp_path):
+    total, shown = documents.show_pages(pdf(tmp_path / "doc.pdf", "one", "two", "three"), "3,1")
+    assert total == 3 and [number for number, _ in shown] == [3, 1]
+    assert all((stored.width, stored.height) == (1448, 2048) for _, stored in shown)
+    assert all((images.root() / stored.file).exists() for _, stored in shown)
+
+
+def test_a_small_page_is_rendered_at_300_dpi_at_most(tmp_path):
+    _, [(_, stored)] = documents.show_pages(pdf(tmp_path / "card.pdf", "card", size=(144, 72)), "1")
+    assert (stored.width, stored.height) == (600, 300)
+
+
+def test_pages_of_a_password_protected_pdf_are_refused(tmp_path):
+    with pytest.raises(documents.DocumentError):
+        documents.show_pages(locked_pdf(tmp_path / "locked.pdf"), "1")
