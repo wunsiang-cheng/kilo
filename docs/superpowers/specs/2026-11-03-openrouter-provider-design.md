@@ -59,6 +59,8 @@ Anthropic 依賴集中在 `kilo/claude.py`（`ClaudeClient`，anthropic SDK、be
 10. **摘要請求**：歷史含工具呼叫時，帶同一組 tools（不設 `tool_choice`）加上「只寫摘要、不要呼叫工具」的 user 訊息，模型回純文字，且吃到快取；不帶 tools 也可行，但無快取。
 11. **摘要放置**：`[system, user(摘要), user(新問題)]`（連續兩則 user 訊息）可正常回答，模型能用摘要中的資訊。
 12. **測試 key**：額度上限 $10，到期時間 2026-11-04 05:19 UTC（台北 13:19）。之後執行 live 測試需換新 key。
+13. **回放歷史裡的工具參數**（最終審查時補測）：Muse Spark 對歷史中 `arguments` 為空字串或無效 JSON 的 assistant 工具呼叫回 400（`` `arguments` must be valid JSON ``）；DeepInfra 提供的 mistral-small-3.2、gemma-3-27b 對無效 JSON 也會在串流中途回 400。改成 `"{}"` 後（保留原本的加密 `reasoning_details`、content 有無皆可）Muse 接受。
+14. **其他 provider 對 kilo 歷史形狀的接受度**（最終審查時補測）：Muse Spark、deepseek-v4-flash、gpt-oss-120b、mistral-small-3.2、gemma-3-27b 都接受連續兩則 user 訊息、另一個模型的加密 `reasoning_details`，以及呼叫不在 `tools` 清單中的函式名稱；mistral-small-3.2、gemma-3-27b 不支援推理，但帶 `reasoning.effort` 也照常回應。
 
 ## 4. 設計
 
@@ -105,6 +107,7 @@ Anthropic 依賴集中在 `kilo/claude.py`（`ClaudeClient`，anthropic SDK、be
 | `summary` | 摘要文字 | `None` |
 
 - 送給 API 的 assistant 訊息只取 `role`、`content`、`tool_calls`、`reasoning_details`（有值者）；`reasoning` 僅供重播顯示，不送回。
+- 儲存時，工具呼叫的 `arguments` 若是 JSON 物件就逐字保留，否則（空白、被截斷、格式錯誤、非物件）存成 `"{}"`：部分 provider 拒絕歷史中出現這些參數（第 3 節第 13 點），否則整個 session 之後都會失敗。該呼叫的結果已說明參數出了什麼問題。
 - session metadata（`context_tokens`、`summary_message_id`、`compactions`、`compact_retry_at`）語意不變。
 - `GET /api/v1/sessions/{id}` 回傳的訊息欄位隨之由 `blocks` 變為 `payload`，role 可能出現 `summary`。web terminal 與 Telegram 不使用這些欄位（它們用事件串流與 `/events`）。
 
@@ -262,7 +265,7 @@ def stream_turn(
 - **JSON Schema 相容性**：部分 provider 對工具 schema 較嚴格；MCP 伺服器提供的 schema 若被拒，會以 LLM error 顯示。目前不處理。
 - **推理顯示量**：輸出完整推理過程的模型（非摘要）會讓 progress 很長；之後可加顯示開關。
 - **快取**：只依賴隱式快取；沒有隱式快取的模型每輪成本較高，可用 `KILO_COMPACT_AT_TOKENS` 調整。
-- **連續兩則 user 訊息**：只以 Muse Spark 驗證；其他 provider 預期可接受（OpenRouter 會正規化），未驗證。
+- **連續兩則 user 訊息**：已在 5 個 provider 上驗證可接受（第 3 節第 14 點）；其他 provider 未驗證。
 - **contributor 方案的資料用途**：OpenRouter 說明未寫明；正式環境使用前請確認 OpenRouter 帳號的 privacy 設定。
 - **測試 key 到期**：2026-11-04 台北 13:19 之後執行 live 測試需換新 key。
 
