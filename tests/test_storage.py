@@ -11,13 +11,21 @@ async def db(tmp_path):
     return database
 
 
-async def test_session_round_trip_with_blocks(db):
+async def test_session_round_trip_with_payload(db):
     session = await db.create_session(title=" Title ", metadata={"a": 1})
-    blocks = [{"type": "text", "text": "學"}]
-    await db.add_message(session.id, MessageRole.ASSISTANT, content="hi", blocks=blocks)
+    payload = {"role": "assistant", "content": "學", "tool_calls": [
+        {"id": "c1", "type": "function", "function": {"name": "glob", "arguments": "{}"}}]}
+    await db.add_message(session.id, MessageRole.ASSISTANT, content="學", payload=payload)
     stored = await db.get_session(session.id)
     assert stored.title == "Title" and stored.metadata == {"a": 1}
-    assert [(m.role, m.content, m.blocks) for m in stored.messages] == [(MessageRole.ASSISTANT, "hi", blocks)]
+    assert [(m.role, m.content, m.payload) for m in stored.messages] == [(MessageRole.ASSISTANT, "學", payload)]
+
+
+async def test_a_summary_keeps_its_role(db):
+    session = await db.create_session()
+    await db.add_message(session.id, MessageRole.SUMMARY, content="the summary")
+    [message] = await db.get_messages(session.id)
+    assert (message.role, message.content, message.payload) == (MessageRole.SUMMARY, "the summary", None)
 
 
 async def test_untitled_session_gets_a_generated_title(db):

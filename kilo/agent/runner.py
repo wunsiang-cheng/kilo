@@ -33,11 +33,15 @@ Write the summary as plain text. Do not call any tools."""
 CONTINUE_AFTER_COMPACTION = "[The conversation so far was compacted into the summary above. Continue the task from where it left off.]"
 COMPACTION_RETRY_TOKENS = 50_000  # after a failed compaction, grow this much before trying again
 CHARS_PER_TOKEN = 4  # rough size of text not yet measured by the API (new messages, tool results)
+# Heads the summary, which takes the place of the conversation it replaces.
+SUMMARY_HEADER = "[Summary of the conversation so far. It replaces the earlier messages, which you can no longer see.]"
+# The fields of a stored assistant turn that go back to the model; its readable reasoning is only shown again.
+REQUEST_FIELDS = ("role", "content", "tool_calls", "reasoning_details")
 
 
 def _is_summary(msg: Any) -> bool:
-    """A stored compaction: the assistant message holding the signed summary block."""
-    return msg.role == MessageRole.ASSISTANT and any(b.get("type") == "compaction" for b in msg.blocks or [])
+    """A stored compaction: the summary the model wrote of the conversation before it."""
+    return msg.role == MessageRole.SUMMARY
 
 
 def _compactable(db_messages: List[Any]) -> bool:
@@ -65,52 +69,40 @@ def _parse_tool_arguments(raw: Any) -> Tuple[Dict[str, Any], Optional[str]]:
 INTERRUPTED_TOOL_RESULT = "Tool call was interrupted before it returned a result."
 
 
-def _tool_results_message(messages: List[Dict[str, Any]], blocks: List[Dict[str, Any]]) -> None:
-    """Append tool_result blocks, merging them into a preceding tool-results user message."""
-    last = messages[-1] if messages else None
-    if last and last["role"] == "user" and isinstance(last["content"], list) and all(
-        b.get("type") == "tool_result" for b in last["content"]
-    ):
-        last["content"].extend(blocks)
-    else:
-        messages.append({"role": "user", "content": list(blocks)})
-
-
 def _api_messages(db_messages: List[Any]) -> List[Dict[str, Any]]:
     """
-    Rebuild the Messages API history from stored messages. Deterministic, so every request
-    replays an identical prefix (thinking blocks stay valid and the prompt cache keeps hitting).
-    History starts at the latest compaction: its summary block replaces everything before it,
-    which stays stored but is never sent again.
-    All tool results of one assistant turn go back in a single user message; a tool_use with no
-    stored result (the run was interrupted) gets an error result so the history stays valid.
+    Rebuild the Chat Completions history from stored messages. Deterministic, so every request replays an
+    identical prefix (the provider's prompt cache keeps hitting, and the reasoning sent back stays valid).
+    History starts at the latest summary: it replaces everything before it, which stays stored but is never
+    sent again. Each tool result is a tool message of its own; a tool call with no stored result (the run was
+    interrupted) gets an error result before the next message, so the history stays valid.
     """
     summaries = [i for i, msg in enumerate(db_messages) if _is_summary(msg)]
     if summaries:
         db_messages = db_messages[summaries[-1]:]
     messages: List[Dict[str, Any]] = []
-    pending: List[str] = []
+    pending: List[str] = []  # calls of the latest assistant turn still without a result
 
     def close_pending() -> None:
-        if pending:
-            _tool_results_message(messages, [
-                {"type": "tool_result", "tool_use_id": tool_use_id, "content": INTERRUPTED_TOOL_RESULT, "is_error": True}
-                for tool_use_id in pending
-            ])
-            pending.clear()
+        messages.extend({"role": "tool", "tool_call_id": call_id, "content": INTERRUPTED_TOOL_RESULT} for call_id in pending)
+        pending.clear()
 
     for msg in db_messages:
         if msg.role == MessageRole.TOOL:
-            blocks = msg.blocks or []
-            for block in blocks:
-                if block.get("tool_use_id") in pending:
-                    pending.remove(block["tool_use_id"])
-            _tool_results_message(messages, blocks)
+            call_id = (msg.payload or {}).get("tool_call_id")
+            if call_id in pending:
+                pending.remove(call_id)
+            messages.append({"role": "tool", "tool_call_id": call_id, "content": msg.content or ""})
             continue
         close_pending()
         if msg.role == MessageRole.ASSISTANT:
-            messages.append({"role": "assistant", "content": msg.blocks if msg.blocks is not None else (msg.content or "")})
-            pending.extend(b["id"] for b in msg.blocks or [] if b.get("type") == "tool_use")
+            if msg.payload is None:
+                messages.append({"role": "assistant", "content": msg.content})
+            else:
+                messages.append({field: msg.payload[field] for field in REQUEST_FIELDS if field in msg.payload})
+            pending.extend(call["id"] for call in (msg.payload or {}).get("tool_calls") or [])
+        elif msg.role == MessageRole.SUMMARY:
+            messages.append({"role": "user", "content": f"{SUMMARY_HEADER}\n\n{msg.content or ''}"})
         else:
             messages.append({"role": "user", "content": msg.content or ""})
     close_pending()
@@ -218,31 +210,39 @@ class AgentRunner:
 
     async def _compact(self, session_id: str, estimate: int, manual: bool = False) -> AsyncGenerator[Dict[str, Any], None]:
         """
-        Replace the session's history with a summary written by the model (on-demand compaction).
-        Yields compaction_start, then compaction_done or compaction_failed. A failure is not fatal:
-        the conversation goes on with its full history, and compaction waits until it has grown
-        another COMPACTION_RETRY_TOKENS.
+        Replace the session's history with a summary the model writes in a turn of its own: the conversation,
+        then the summary instructions. Yields compaction_start, then compaction_done or compaction_failed.
+        A failure is not fatal: the conversation goes on with its full history, and compaction waits until
+        it has grown another COMPACTION_RETRY_TOKENS.
         """
         yield {"event": "compaction_start", "data": {"context_tokens": estimate, "manual": manual}}
-        messages = _api_messages(await self._history(session_id))
+        # The conversation's own system prompt and tools, so the request reuses the prefix the provider has cached.
+        # (Tools cannot be turned off with tool_choice "none": some providers refuse it.)
+        messages = _api_messages(await self._history(session_id)) + [{"role": "user", "content": COMPACTION_INSTRUCTIONS}]
         try:
             for max_tokens in (settings.kilo_compact_max_tokens, 2 * settings.kilo_compact_max_tokens):
-                result = await self.client.compact(
+                final: Optional[Dict[str, Any]] = None
+                async for event in self.client.stream_turn(
                     system=self._system_prompt(),
                     messages=messages,
                     tools=self.toolbox.definitions(),
-                    instructions=COMPACTION_INSTRUCTIONS,
                     max_tokens=max_tokens,
-                )
-                if result.get("stop_reason") != "max_tokens":  # a summary cut off is retried once with more room
+                ):
+                    if event.get("type") == "done":
+                        final = event
+                if final is None:
+                    raise RuntimeError("the response stream ended without a final message")
+                if final.get("finish_reason") != "length":  # a summary cut off is retried once with more room
                     break
         except Exception as e:
             error = f"LLM error: {e}"
         else:
-            summary = [b for b in result.get("content") or [] if b.get("type") == "compaction" and b.get("content")]
-            if result.get("stop_reason") == "compaction" and summary:
-                summary_message = await self.db.add_message(session_id=session_id, role=MessageRole.ASSISTANT, blocks=result["content"])
-                after = result.get("summary_tokens") or 0
+            finish = final.get("finish_reason")
+            # The summary is the reply's text; tool calls the model made anyway are not run.
+            summary = ((final.get("message") or {}).get("content") or "").strip()
+            if finish in ("stop", "tool_calls") and summary:
+                summary_message = await self.db.add_message(session_id=session_id, role=MessageRole.SUMMARY, content=summary)
+                after = len(summary) // CHARS_PER_TOKEN
                 compactions = (await self._metadata(session_id)).get("compactions") or 0
                 # Until the next reply measures it, the conversation counts as its summary (system prompt and tools aside).
                 await self.db.update_session(session_id, metadata={
@@ -251,7 +251,7 @@ class AgentRunner:
                 })
                 yield {"event": "compaction_done", "data": {"context_tokens": estimate, "summary_tokens": after}}
                 return
-            error = f"no summary was written (stop reason: {result.get('stop_reason')})"
+            error = f"no summary was written (finish reason: {finish})"
         await self.db.update_session(session_id, metadata={"compact_retry_at": estimate + COMPACTION_RETRY_TOKENS})
         yield {"event": "compaction_failed", "data": {"error": error}}
 
@@ -347,32 +347,33 @@ class AgentRunner:
                 yield {"event": "error", "data": {"error": "LLM error: the response stream ended without a final message."}}
                 return
 
-            stop_reason = final.get("stop_reason")
-            blocks = final.get("content") or []
+            finish_reason = final.get("finish_reason")
+            message = final.get("message") or {}
             if final.get("context_tokens"):
                 context, unmeasured = final["context_tokens"], 0
                 await self.db.update_session(session_id, metadata={"context_tokens": context})
 
-            if stop_reason == "refusal":
-                # Every model in the fallback chain declined; the partial turn is discarded.
-                category = (final.get("stop_details") or {}).get("category") or "unspecified"
-                yield {"event": "error", "data": {"error": f"Claude declined this request (category: {category})."}}
+            if finish_reason == "content_filter":
+                # The provider's content filter stopped the reply; the partial turn is discarded.
+                yield {"event": "error", "data": {"error": "The model declined this request (content filter)."}}
                 return
 
-            if blocks:
+            tool_calls = message.get("tool_calls") or []
+            # An assistant message with neither text nor tool calls is refused by some providers when sent back.
+            if message.get("content") or tool_calls:
                 await self.db.add_message(
                     session_id=session_id,
                     role=MessageRole.ASSISTANT,
-                    content=current_assistant_content or None,
-                    blocks=blocks,
+                    content=message.get("content") or None,
+                    payload=message,
                 )
 
-            tool_uses = [b for b in blocks if b.get("type") == "tool_use"]
-            if tool_uses:
-                for tool_use in tool_uses:
-                    call_id = tool_use["id"]
-                    fn_name = self.toolbox.canonical_name(tool_use.get("name", "unknown"))
-                    args, args_error = _parse_tool_arguments(tool_use.get("input"))
+            if tool_calls:
+                for tool_call in tool_calls:
+                    call_id = tool_call["id"]
+                    function = tool_call.get("function") or {}
+                    fn_name = self.toolbox.canonical_name(function.get("name") or "unknown")
+                    args, args_error = _parse_tool_arguments(function.get("arguments"))
 
                     yield {
                         "event": "tool_call_start",
@@ -383,11 +384,12 @@ class AgentRunner:
                         },
                     }
 
-                    if stop_reason != "tool_use":
-                        # The turn was cut off (e.g. max_tokens), so this call's input may be incomplete.
+                    if finish_reason == "length":
+                        # The reply was cut off, so this call's arguments may be incomplete. (Some providers end a
+                        # turn of tool calls with "stop", so only a cut-off reply keeps its calls from running.)
                         result_str = json.dumps({
                             "status": "error",
-                            "message": f"Not executed: the response stopped ({stop_reason}) before this tool call was complete.",
+                            "message": f"Not executed: the response stopped ({finish_reason}) before this tool call was complete.",
                         })
                     elif args_error is None:
                         token = current_session_id.set(session_id)
@@ -409,14 +411,11 @@ class AgentRunner:
                         parsed_res = {"raw": result_str}
 
                     unmeasured += len(result_str)
-                    result_block: Dict[str, Any] = {"type": "tool_result", "tool_use_id": call_id, "content": result_str}
-                    if isinstance(parsed_res, dict) and parsed_res.get("status") == "error":
-                        result_block["is_error"] = True
                     await self.db.add_message(
                         session_id=session_id,
                         role=MessageRole.TOOL,
                         content=result_str,
-                        blocks=[result_block],
+                        payload={"role": "tool", "tool_call_id": call_id, "content": result_str},
                     )
 
                     yield {
@@ -431,8 +430,8 @@ class AgentRunner:
                 # Continue next turn to let the model process tool results
                 continue
 
-            if stop_reason not in ("end_turn", "stop_sequence"):
-                yield {"event": "error", "data": {"error": f"Response stopped early ({stop_reason})."}}
+            if finish_reason != "stop":
+                yield {"event": "error", "data": {"error": f"Response stopped early ({finish_reason})."}}
                 return
 
             yield {

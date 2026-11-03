@@ -1,6 +1,7 @@
 """Stand-ins for what lies outside Kilo (the LLM and the clock), and how tests wait for what runs in the background."""
 
 import asyncio
+import json
 import time
 from datetime import datetime, timedelta
 from typing import Any, AsyncIterator, Dict, List, Optional
@@ -14,22 +15,20 @@ async def until(condition, seconds: float = 10) -> None:
         await asyncio.sleep(0.02)
 
 
-def text_turn(text: str, stop_reason: str = "end_turn") -> List[Dict[str, Any]]:
-    """One assistant turn that only says `text`."""
-    return [
-        {"type": "text", "delta": text},
-        {
-            "type": "done", "stop_reason": stop_reason, "stop_details": None,
-            "content": [{"type": "text", "text": text}], "context_tokens": 100,
-        },
-    ]
+def text_turn(text: str, finish_reason: str = "stop") -> List[Dict[str, Any]]:
+    """One assistant turn that only says `text` (no text event when it is empty, as the client sends none)."""
+    events: List[Dict[str, Any]] = [{"type": "text", "delta": text}] if text else []
+    done = {"type": "done", "finish_reason": finish_reason, "message": {"role": "assistant", "content": text or None}, "context_tokens": 100}
+    return [*events, done]
 
 
-def tool_turn(call_id: str, name: str, args: Dict[str, Any], stop_reason: str = "tool_use") -> List[Dict[str, Any]]:
-    """One assistant turn that calls one tool."""
+def tool_turn(call_id: str, name: str, args: Any, finish_reason: str = "tool_calls") -> List[Dict[str, Any]]:
+    """One assistant turn that calls one tool; `args` given as a str is sent as the raw arguments."""
+    arguments = args if isinstance(args, str) else json.dumps(args)
+    call = {"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}
     return [{
-        "type": "done", "stop_reason": stop_reason, "stop_details": None,
-        "content": [{"type": "tool_use", "id": call_id, "name": name, "input": args}], "context_tokens": 100,
+        "type": "done", "finish_reason": finish_reason, "context_tokens": 100,
+        "message": {"role": "assistant", "content": None, "tool_calls": [call]},
     }]
 
 
@@ -38,16 +37,14 @@ class FakeModel:
 
     def __init__(self, turns: Optional[List[List[Any]]] = None):
         self.turns: List[List[Any]] = list(turns or [])
-        self.requests: List[List[Dict[str, Any]]] = []
-        self.compact_result: Dict[str, Any] = {
-            "stop_reason": "compaction",
-            "content": [{"type": "compaction", "content": "summary"}],
-            "summary_tokens": 50,
-        }
-        self.compactions = 0
+        self.requests: List[List[Dict[str, Any]]] = []  # the messages of each call
+        self.max_tokens: List[Optional[int]] = []  # the max_tokens of each call
 
-    async def stream_turn(self, system: str, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]) -> AsyncIterator[Dict[str, Any]]:
+    async def stream_turn(
+        self, system: str, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]], max_tokens: Optional[int] = None,
+    ) -> AsyncIterator[Dict[str, Any]]:
         self.requests.append(messages)
+        self.max_tokens.append(max_tokens)
         if not self.turns:
             raise AssertionError("FakeModel was asked for more turns than it has.")
         for item in self.turns.pop(0):
@@ -57,12 +54,6 @@ class FakeModel:
                 await item()
                 continue
             yield item
-
-    async def compact(self, system: str, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]], instructions: str, max_tokens: int) -> Dict[str, Any]:
-        self.compactions += 1
-        if isinstance(self.compact_result, Exception):
-            raise self.compact_result
-        return self.compact_result
 
 
 class FakeClock:

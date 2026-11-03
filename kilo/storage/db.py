@@ -25,7 +25,7 @@ def _message(r: Any) -> Message:
         session_id=r["session_id"],
         role=MessageRole(r["role"]),
         content=r["content"],
-        blocks=json.loads(r["blocks"]) if r["blocks"] else None,
+        payload=json.loads(r["payload"]) if r["payload"] else None,
         created_at=_parse_iso(r["created_at"]),
     )
 
@@ -54,7 +54,7 @@ class Database:
                     session_id TEXT NOT NULL,
                     role TEXT NOT NULL,
                     content TEXT,
-                    blocks TEXT,
+                    payload TEXT,
                     created_at TEXT NOT NULL,
                     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
                 );
@@ -109,7 +109,7 @@ class Database:
             if include_messages:
                 msg_cursor = await conn.execute(
                     """
-                    SELECT id, session_id, role, content, blocks, created_at
+                    SELECT id, session_id, role, content, payload, created_at
                     FROM messages
                     WHERE session_id = ?
                     ORDER BY rowid ASC
@@ -198,20 +198,20 @@ class Database:
         session_id: str,
         role: MessageRole,
         content: Optional[str] = None,
-        blocks: Optional[List[Dict[str, Any]]] = None,
+        payload: Optional[Dict[str, Any]] = None,
         message_id: Optional[str] = None,
     ) -> Message:
         mid = message_id or f"msg_{uuid.uuid4().hex[:12]}"
         now = _iso_now()
-        blocks_json = json.dumps(blocks) if blocks is not None else None
+        payload_json = json.dumps(payload) if payload is not None else None
 
         async with aiosqlite.connect(self.db_path) as conn:
             await conn.execute(
                 """
-                INSERT INTO messages (id, session_id, role, content, blocks, created_at)
+                INSERT INTO messages (id, session_id, role, content, payload, created_at)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (mid, session_id, role.value, content, blocks_json, now),
+                (mid, session_id, role.value, content, payload_json, now),
             )
             # Update session's updated_at
             await conn.execute(
@@ -225,7 +225,7 @@ class Database:
             session_id=session_id,
             role=role,
             content=content,
-            blocks=blocks,
+            payload=payload,
             created_at=_parse_iso(now),
         )
 
@@ -234,7 +234,7 @@ class Database:
         A session's messages in the order they were added (insertion order: a clock set back cannot reorder
         them). With `since_id`, only that message and the ones after it, e.g. from the latest summary on.
         """
-        query = "SELECT id, session_id, role, content, blocks, created_at FROM messages WHERE session_id = ?"
+        query = "SELECT id, session_id, role, content, payload, created_at FROM messages WHERE session_id = ?"
         params: tuple = (session_id,)
         if since_id:
             query += " AND rowid >= COALESCE((SELECT rowid FROM messages WHERE id = ? AND session_id = ?), 0)"

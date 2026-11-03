@@ -144,7 +144,7 @@ async def test_stop_says_when_nothing_is_running(authed, session_id):
 
 
 async def test_compact_endpoint(authed, session_id, model):
-    model.turns.append(text_turn("hello"))
+    model.turns.extend([text_turn("hello"), text_turn("the summary")])
     await authed.post(f"{API}/sessions/{session_id}/chat", json={"message": "hi", "stream": False})
     assert (await authed.post(f"{API}/sessions/{session_id}/compact")).json()["event"] == "compaction_done"
 
