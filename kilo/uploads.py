@@ -26,7 +26,7 @@ NAME_PUNCTUATION = frozenset(" .-_()+,=@")
 GENERIC_TYPE = "application/octet-stream"
 NOTE_HEADER = (
     "[Files sent with this message, saved in the workspace. Their contents are not included here; "
-    "read them with your tools when you need them."
+    "read them with read_file when you need them."
 )
 
 

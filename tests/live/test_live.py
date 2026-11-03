@@ -4,6 +4,7 @@ Real OpenRouter API calls, with the key from the project's `.env`. They cost a l
     uv run pytest -m live
 """
 
+import io
 import os
 import secrets
 import socket
@@ -15,6 +16,7 @@ from pathlib import Path
 import httpx
 import pytest
 from dotenv import dotenv_values
+from PIL import Image, ImageDraw, ImageFont
 
 from kilo.assembly import Kilo
 from kilo.config import DEFAULT_PASSWORD, DEFAULT_USERNAME
@@ -159,3 +161,27 @@ def test_real_upload_is_read_not_sent(real_server):
     calls = {event["data"]["name"] for event in reply["events"] if event["event"] == "tool_call_start"}
     assert calls & {"read_file", "shell"}, reply["events"]
     assert word in reply["response"]
+
+
+def test_real_image_is_seen(real_server):
+    """The number is only drawn in the image, so the model must look at it with read_file to answer."""
+    number = str(secrets.randbelow(9000) + 1000)
+    picture = Image.new("RGB", (900, 320), "white")
+    ImageDraw.Draw(picture).text((60, 60), number, fill="black", font=ImageFont.load_default(size=180))
+    buffer = io.BytesIO()
+    picture.save(buffer, "PNG")
+    with httpx.Client(base_url=real_server, timeout=180) as http:
+        login = http.post("/api/v1/auth/login", json={"username": DEFAULT_USERNAME, "password": DEFAULT_PASSWORD})
+        assert login.status_code == 200
+        attachment = http.post(
+            "/api/v1/uploads", params={"name": "number.png"}, content=buffer.getvalue(),
+            headers={"content-type": "image/png"},
+        ).json()
+        session = http.post("/api/v1/sessions").json()
+        reply = http.post(f"/api/v1/sessions/{session['id']}/chat", json={
+            "message": "What number is written in the image I sent? Reply with the number only.",
+            "attachments": [attachment], "stream": False,
+        }).json()
+    calls = {event["data"]["name"] for event in reply["events"] if event["event"] == "tool_call_start"}
+    assert "read_file" in calls, reply["events"]
+    assert number in reply["response"]

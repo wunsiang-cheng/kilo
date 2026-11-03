@@ -163,7 +163,7 @@ RENAMED = Attachment(path="uploads/2026-11-03/report-2.pdf", name="report.pdf", 
 def test_note_lists_each_file():
     assert uploads.note([REPORT, RENAMED]) == (
         "[Files sent with this message, saved in the workspace. Their contents are not included here; "
-        "read them with your tools when you need them.\n"
+        "read them with read_file when you need them.\n"
         "- uploads/2026-11-03/report.pdf (application/pdf, 2.3 MB)\n"
         '- uploads/2026-11-03/report-2.pdf (application/pdf, 1.1 MB, sent as "report.pdf")]'
     )
