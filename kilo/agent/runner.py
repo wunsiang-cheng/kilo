@@ -2,13 +2,13 @@
 
 import asyncio
 import json
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Dict, List, Optional, Sequence, Tuple
 
-from kilo import workspace
+from kilo import uploads, workspace
 from kilo.config import settings
 from kilo.context import current_session_id
 from kilo.agent.chat_model import ChatModel
-from kilo.models.session import MessageRole
+from kilo.models.session import Attachment, MessageRole
 from kilo.storage.db import Database
 from kilo.tools import Toolbox
 
@@ -23,6 +23,7 @@ COMPACTION_INSTRUCTIONS = """Summarize this conversation between a user and Kilo
 - The user's goals and requests, and the latest request still open.
 - Decisions made and why; constraints and preferences the user stated.
 - Files and directories created, edited or inspected, with exact paths and the state they were left in.
+- Files the user sent, with their paths.
 - Commands that matter later, with their outcomes; errors not yet resolved.
 - Schedule, run and task ids, and other identifiers in use.
 - What was in progress at the end, and the next steps.
@@ -88,6 +89,12 @@ def _replayable(message: Dict[str, Any]) -> Dict[str, Any]:
 INTERRUPTED_TOOL_RESULT = "Tool call was interrupted before it returned a result."
 
 
+def _user_content(msg: Any) -> str:
+    """A stored user message as the model gets it: its text, then where the files sent with it are."""
+    attached = [Attachment.model_validate(a) for a in (msg.payload or {}).get("attachments") or []]
+    return uploads.with_note(msg.content or "", attached)
+
+
 def _api_messages(db_messages: List[Any]) -> List[Dict[str, Any]]:
     """
     Rebuild the Chat Completions history from stored messages. Deterministic, so every request replays an
@@ -123,7 +130,7 @@ def _api_messages(db_messages: List[Any]) -> List[Dict[str, Any]]:
         elif msg.role == MessageRole.SUMMARY:
             messages.append({"role": "user", "content": f"{SUMMARY_HEADER}\n\n{msg.content or ''}"})
         else:
-            messages.append({"role": "user", "content": msg.content or ""})
+            messages.append({"role": "user", "content": _user_content(msg)})
     close_pending()
     return messages
 
@@ -161,6 +168,7 @@ class AgentRunner:
         session_id: str,
         user_message: str,
         max_turns: int = 100,
+        attachments: Sequence[Attachment] = (),
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         Run the agent loop for a session and yield streaming SSE events.
@@ -181,7 +189,7 @@ class AgentRunner:
             if task is not None:
                 _active_turns[session_id] = task
             try:
-                async for event in self._run_chat_stream(session_id, user_message, max_turns):
+                async for event in self._run_chat_stream(session_id, user_message, max_turns, attachments):
                     yield event
             finally:
                 if _active_turns.get(session_id) is task:
@@ -279,6 +287,7 @@ class AgentRunner:
         session_id: str,
         user_message: str,
         max_turns: int,
+        attachments: Sequence[Attachment] = (),
     ) -> AsyncGenerator[Dict[str, Any], None]:
         # Connect configured MCP servers so their tools are available (and a summary sees the same tools)
         await self.toolbox.ensure_started()
@@ -287,7 +296,7 @@ class AgentRunner:
         # (a large first message alone is no reason: there is nothing before it to summarize)
         meta = await self._metadata(session_id)
         context = meta.get("context_tokens") or 0  # as measured after the last turn
-        incoming = len(user_message)
+        incoming = len(uploads.with_note(user_message, attachments))  # as the model will get it
         if self._compaction_due(context + incoming // CHARS_PER_TOKEN, meta) and _compactable(
             await self._history(session_id)
         ):
@@ -301,6 +310,7 @@ class AgentRunner:
             session_id=session_id,
             role=MessageRole.USER,
             content=user_message,
+            payload={"attachments": [a.model_dump() for a in attachments]} if attachments else None,
         )
         yield {
             "event": "user_message",
@@ -308,13 +318,14 @@ class AgentRunner:
                 "id": user_msg_obj.id,
                 "session_id": session_id,
                 "content": user_message,
+                "attachments": [a.model_dump() for a in attachments],
             },
         }
 
         # Auto-title session if it's currently untitled or generic
         session = await self.db.get_session(session_id, include_messages=False)
         if session and session.title.startswith("Session sess_"):
-            new_title = user_message.strip().split("\n")[0][:40]
+            new_title = user_message.strip().split("\n")[0][:40] or (attachments[0].name[:40] if attachments else "")
             if new_title:
                 await self.db.update_session(session_id, title=new_title)
 
