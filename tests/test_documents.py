@@ -3,6 +3,7 @@
 import os
 import time
 from dataclasses import replace
+from datetime import datetime, time as clock_time
 from pathlib import Path
 
 import pytest
@@ -11,7 +12,7 @@ from docx.oxml.ns import nsdecls
 from docx.shared import Inches
 
 from kilo import documents
-from samples import png_bytes, word
+from samples import png_bytes, with_saved_value, word, workbook
 
 pytestmark = pytest.mark.usefixtures("data_dir")
 DAY = 86400
@@ -148,3 +149,72 @@ def test_conversions_unused_for_30_days_are_deleted(tmp_path):
         os.utime(path, (time.time() - days * DAY,) * 2)
     documents.convert(word(tmp_path / "new.docx", lambda document: document.add_paragraph("new")))
     assert not old.exists() and recent.exists()
+
+
+def test_a_sheet_is_a_table_with_its_column_letters_and_row_numbers(tmp_path):
+    def build(book):
+        sheet = book.active
+        sheet.title = "銷售"
+        sheet.append(["Date", "Item", "Amount", "Paid"])
+        sheet.append([datetime(2026, 1, 3), "Pen | blue", 120, True])
+        sheet.append([datetime(2026, 1, 4, 14, 30), "Line\nbreak", 0.5, False])
+        sheet["A5"] = clock_time(9, 15)
+
+    assert text_of(workbook(tmp_path / "sales.xlsx", build)) == "\n".join([
+        "## Sheet 1: 銷售", "",
+        "|   | A | B | C | D |",
+        "| --- | --- | --- | --- | --- |",
+        "| 1 | Date | Item | Amount | Paid |",
+        "| 2 | 2026-01-03 | Pen \\| blue | 120 | TRUE |",
+        "| 3 | 2026-01-04 14:30:00 | Line<br>break | 0.5 | FALSE |",
+        "| 5 | 09:15:00 |  |  |  |", "",
+    ])
+
+
+def test_cells_keep_their_addresses(tmp_path):
+    def build(book):
+        book.active["C5"] = "far"
+        book.active["E7"] = 3
+
+    assert text_of(workbook(tmp_path / "far.xlsx", build)) == "\n".join([
+        "## Sheet 1: Sheet", "",
+        "|   | A | B | C | D | E |",
+        "| --- | --- | --- | --- | --- | --- |",
+        "| 5 |  |  | far |  |  |",
+        "| 7 |  |  |  |  | 3 |", "",
+    ])
+
+
+def test_hidden_and_empty_sheets_are_marked(tmp_path):
+    def build(book):
+        book.active.title = "Empty"
+        secret = book.create_sheet("Secret")
+        secret.sheet_state = "hidden"
+        secret["A1"] = "x"
+
+    assert text_of(workbook(tmp_path / "sheets.xlsx", build)) == "\n".join([
+        "## Sheet 1: Empty", "", "(empty)", "",
+        "## Sheet 2: Secret (hidden)", "",
+        "|   | A |", "| --- | --- |", "| 1 | x |", "",
+    ])
+
+
+def test_a_formula_shows_the_value_saved_with_it(tmp_path):
+    def build(book):
+        book.active.append([2, "=A1*2"])
+        book.active.append([3, "=A2*2"])
+
+    path = with_saved_value(workbook(tmp_path / "formulas.xlsx", build), "A1*2", "4")
+    assert text_of(path).splitlines()[4:6] == ["| 1 | 2 | 4 |", "| 2 | 3 |  |"]
+
+
+def test_a_long_sheet_stops_at_the_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(documents, "MAX_CHARS", 200)
+
+    def build(book):
+        for i in range(1000):
+            book.active.append([i])
+
+    text = text_of(workbook(tmp_path / "long.xlsx", build))
+    assert text.endswith("[Conversion stopped here: the text passed 200 characters. The rest of the file is not included.]\n")
+    assert "| 1000 |" not in text

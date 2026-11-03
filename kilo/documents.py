@@ -4,6 +4,7 @@ Documents the agent reads (Word, Excel, PowerPoint, PDF), converted to Markdown 
 can search it whole.
 """
 
+import datetime as dt
 import hashlib
 import os
 import re
@@ -17,6 +18,8 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequ
 import docx
 import docx.table
 import docx.text.paragraph
+import openpyxl
+from openpyxl.utils import get_column_letter
 
 from kilo.config import settings
 
@@ -223,8 +226,63 @@ def _docx_lines(path: Path) -> Iterator[str]:
             yield ""
 
 
+# Excel
+
+
+def _sheet_value(value: Any) -> str:
+    """A cell's value as text: dates and times in ISO form, booleans as Excel shows them, nothing for an empty cell."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):  # before numbers: a bool is an int
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, dt.datetime):
+        return value.date().isoformat() if value.time() == dt.time() else value.isoformat(sep=" ")
+    if isinstance(value, (dt.date, dt.time)):
+        return value.isoformat()
+    return str(value)
+
+
+def _xlsx_lines(path: Path) -> Iterator[str]:
+    """
+    Each sheet as a table headed by its column letters, each row with its number, so cells keep their addresses.
+    Formulas show the value saved with them. Rows stop being read once the text passes MAX_CHARS (convert stops
+    there anyway), so a huge sheet is never held whole.
+    """
+    book = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
+    try:
+        gathered = 0
+        for number, sheet in enumerate(book.worksheets, 1):
+            hidden = " (hidden)" if sheet.sheet_state != "visible" else ""
+            yield f"## Sheet {number}: {sheet.title}{hidden}"
+            yield ""
+            rows: List[List[str]] = []
+            width = 0
+            # Rows from 1 and cells from column A, the empty ones before data filled in: positions are addresses.
+            for row_number, values in enumerate(sheet.iter_rows(values_only=True), 1):
+                if gathered > MAX_CHARS:
+                    break
+                cells = [_sheet_value(value) for value in values]
+                filled = [column for column, cell in enumerate(cells, 1) if cell]
+                if not filled:
+                    continue
+                width = max(width, filled[-1])
+                rows.append([str(row_number), *cells])
+                gathered += sum(len(cell) + 3 for cell in cells)
+            if rows:
+                header = [" ", *(get_column_letter(column) for column in range(1, width + 1))]
+                yield from _table([header, *(row[: width + 1] for row in rows)])
+            else:
+                yield "(empty)"
+            yield ""
+            if gathered > MAX_CHARS:
+                return
+    finally:
+        book.close()
+
+
 KINDS: Dict[str, Kind] = {
     ".docx": Kind("docx", "a Word document", _docx_lines, zipped=True),
+    ".xlsx": Kind("xlsx", "an Excel workbook", _xlsx_lines, zipped=True),
 }
 
 
