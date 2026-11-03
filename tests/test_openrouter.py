@@ -204,3 +204,118 @@ async def test_without_an_api_key_nothing_is_sent():
     with pytest.raises(OpenRouterError, match="OPENROUTER_API_KEY is not set"):
         await turn(client)
     assert requests == []
+
+
+def respond(*responses: Any):
+    """Answer each request with the next of `responses`: an httpx.Response, or an exception to raise."""
+    queue = list(responses)
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        item = queue.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    return responder
+
+
+def failure(status: int, body: Any, **headers: str) -> httpx.Response:
+    if isinstance(body, dict):
+        return httpx.Response(status, json=body, headers=headers)
+    return httpx.Response(status, text=body, headers=headers)
+
+
+def ok() -> httpx.Response:
+    return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=TEXT)
+
+
+@pytest.fixture
+def sleeps() -> List[float]:
+    return []
+
+
+def retrying(responses: List[Any], requests: List[httpx.Request], sleeps: List[float]) -> OpenRouterClient:
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    return client_for(respond(*responses), requests, sleep=sleep)
+
+
+async def test_an_http_error_reports_the_providers_own_message(sleeps):
+    raw = '{"error":{"message":"only auto is supported for tool_choice"}}'
+    body = {"error": {"message": "Provider returned error", "code": 400, "metadata": {"raw": raw, "provider_name": "Meta"}}}
+    requests: List[httpx.Request] = []
+    with pytest.raises(OpenRouterError) as caught:
+        await turn(retrying([failure(400, body)], requests, sleeps))
+    assert caught.value.status == 400
+    assert str(caught.value) == f"OpenRouter 400: Provider returned error ({raw})"
+    assert len(requests) == 1 and sleeps == []
+
+
+async def test_moderation_reasons_are_reported(sleeps):
+    body = {"error": {"message": "Input was flagged", "code": 403, "metadata": {"reasons": ["violence", "hate"]}}}
+    with pytest.raises(OpenRouterError, match=r"Input was flagged \(reasons: violence, hate\)"):
+        await turn(retrying([failure(403, body)], [], sleeps))
+
+
+async def test_a_non_json_error_body_is_shown_as_text(sleeps):
+    with pytest.raises(OpenRouterError, match="<html>Bad request</html>"):
+        await turn(retrying([failure(400, "<html>Bad request</html>")], [], sleeps))
+
+
+@pytest.mark.parametrize("status", [400, 401, 402, 403, 404])
+async def test_client_errors_are_not_retried(status, sleeps):
+    requests: List[httpx.Request] = []
+    with pytest.raises(OpenRouterError):
+        await turn(retrying([failure(status, {"error": {"message": "no", "code": status}})], requests, sleeps))
+    assert len(requests) == 1 and sleeps == []
+
+
+async def test_a_rate_limit_is_retried_after_the_delay_it_asks_for(sleeps):
+    requests: List[httpx.Request] = []
+    limited = failure(429, {"error": {"message": "slow down", "code": 429}}, **{"Retry-After": "3"})
+    events = await turn(retrying([limited, ok()], requests, sleeps))
+    assert events[-1]["finish_reason"] == "stop" and len(requests) == 2 and sleeps == [3.0]
+
+
+async def test_server_errors_back_off_then_give_up(sleeps):
+    requests: List[httpx.Request] = []
+    busy = [failure(503, {"error": {"message": "no provider available", "code": 503}}) for _ in range(3)]
+    with pytest.raises(OpenRouterError, match="OpenRouter 503: no provider available"):
+        await turn(retrying(busy, requests, sleeps))
+    assert len(requests) == 3 and sleeps == [1.0, 2.0]
+
+
+async def test_a_long_or_unreadable_retry_after_falls_back_to_backoff(sleeps):
+    limited = lambda after: failure(429, {"error": {"message": "slow down", "code": 429}}, **{"Retry-After": after})
+    await turn(retrying([limited("120"), limited("Wed, 21 Oct 2026 07:28:00 GMT"), ok()], [], sleeps))
+    assert sleeps == [1.0, 2.0]
+
+
+async def test_a_connection_failure_is_retried(sleeps):
+    events = await turn(retrying([httpx.ConnectError("refused"), ok()], [], sleeps))
+    assert events[-1]["finish_reason"] == "stop" and sleeps == [1.0]
+
+
+async def test_a_connection_that_never_succeeds_is_reported(sleeps):
+    with pytest.raises(OpenRouterError, match="could not reach OpenRouter"):
+        await turn(retrying([httpx.ConnectError("refused") for _ in range(3)], [], sleeps))
+
+
+async def test_an_error_after_the_reply_started_is_not_retried(sleeps):
+    requests: List[httpx.Request] = []
+    broken = sse(chunk({"content": "par"}), {"error": {"code": 502, "message": "Provider disconnected"}, "choices": []})
+    with pytest.raises(OpenRouterError, match="Provider disconnected"):
+        await turn(retrying([httpx.Response(200, content=broken), ok()], requests, sleeps))
+    assert len(requests) == 1
+
+
+async def test_a_connection_lost_mid_reply_is_reported_not_retried(sleeps):
+    async def body():
+        yield ("data: " + json.dumps(chunk({"content": "par"})) + "\n\n").encode()
+        raise httpx.ReadError("connection reset")
+
+    requests: List[httpx.Request] = []
+    with pytest.raises(OpenRouterError, match="connection reset"):
+        await turn(retrying([httpx.Response(200, content=body()), ok()], requests, sleeps))
+    assert len(requests) == 1

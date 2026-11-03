@@ -14,6 +14,11 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=10.0)
 # Fields of a streamed reasoning detail that arrive in pieces; every other field arrives whole.
 JOINED_DETAIL_FIELDS = ("text", "summary", "data")
+# Retried before the reply starts streaming; a reply under way is never retried, as its text may already be shown.
+RETRY_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+MAX_RETRIES = 2
+BACKOFF = (1.0, 2.0)  # seconds before the 1st and the 2nd retry, unless the response asks for a delay
+MAX_RETRY_AFTER = 60.0  # a longer Retry-After is not waited for
 
 
 class OpenRouterError(Exception):
@@ -26,6 +31,34 @@ class OpenRouterError(Exception):
     def __str__(self) -> str:
         message = self.args[0]
         return f"OpenRouter {self.status}: {message}" if self.status is not None else f"OpenRouter: {message}"
+
+
+async def _http_error(response: httpx.Response) -> OpenRouterError:
+    """The error an HTTP error response describes, with the provider's own message when OpenRouter passes it on."""
+    await response.aread()
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    error = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(error, dict):
+        return OpenRouterError(response.text[:500] or response.reason_phrase, response.status_code)
+    message = error.get("message") or response.reason_phrase
+    metadata = error.get("metadata") or {}
+    if metadata.get("raw"):  # "Provider returned error" alone says nothing; the provider's answer says why
+        message += f" ({str(metadata['raw'])[:500]})"
+    if metadata.get("reasons"):  # moderation
+        message += f" (reasons: {', '.join(map(str, metadata['reasons']))})"
+    return OpenRouterError(message, response.status_code)
+
+
+def _retry_delay(response: httpx.Response, attempt: int) -> float:
+    """Seconds to wait before retrying: the response's Retry-After when it is a short delay in seconds, else the backoff."""
+    try:
+        asked = float(response.headers.get("retry-after", ""))
+    except ValueError:
+        return BACKOFF[attempt]
+    return asked if 0 <= asked <= MAX_RETRY_AFTER else BACKOFF[attempt]
 
 
 class _Reply:
@@ -162,11 +195,8 @@ class OpenRouterClient:
         )
 
         reply = _Reply()
-        response = await self._http.send(request, stream=True)
+        response = await self._send(request)
         try:
-            if response.status_code >= 400:
-                await response.aread()
-                raise OpenRouterError(response.text[:500] or response.reason_phrase, response.status_code)
             async for line in response.aiter_lines():
                 if not line.startswith("data:"):
                     continue  # a blank line ends an event; a line starting with ":" is a keepalive comment
@@ -175,6 +205,8 @@ class OpenRouterClient:
                     break
                 for event in reply.add(json.loads(data)):
                     yield event
+        except httpx.TransportError as e:
+            raise OpenRouterError(f"the connection broke during the reply ({type(e).__name__}: {e})") from e
         finally:
             await response.aclose()
 
@@ -186,3 +218,25 @@ class OpenRouterClient:
             "message": reply.message(),
             "context_tokens": reply.context_tokens(),
         }
+
+    async def _send(self, request: httpx.Request) -> httpx.Response:
+        """Send the request; returns the response once it starts streaming, retrying what may succeed if tried again."""
+        attempt = 0
+        while True:
+            try:
+                response = await self._http.send(request, stream=True)
+            except httpx.TransportError as e:
+                if attempt == MAX_RETRIES:
+                    raise OpenRouterError(f"could not reach OpenRouter ({type(e).__name__}: {e})") from e
+                delay = BACKOFF[attempt]
+            else:
+                if response.status_code < 400:
+                    return response
+                try:
+                    if response.status_code not in RETRY_STATUSES or attempt == MAX_RETRIES:
+                        raise await _http_error(response)
+                    delay = _retry_delay(response, attempt)
+                finally:
+                    await response.aclose()
+            await self._sleep(delay)
+            attempt += 1
