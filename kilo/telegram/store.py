@@ -1,8 +1,13 @@
-"""What the bot keeps (same database file as sessions): each chat's current session, the chat each session was used from, and the sessions each group owns."""
+"""
+What the bot keeps (same database file as sessions): each chat's current session, the chat each session was used
+from, the sessions each group owns, and the files a user sent without a caption, kept for their next message.
+"""
 
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Sequence
 import aiosqlite
+
+from kilo.models.session import Attachment
 
 
 class TelegramStore:
@@ -22,6 +27,11 @@ class TelegramStore:
             # The sessions made in a group, the only ones it may use (everyone in it sees what the bot says).
             await conn.execute(
                 "CREATE TABLE IF NOT EXISTS telegram_owned (session_id TEXT PRIMARY KEY, chat_id INTEGER NOT NULL)"
+            )
+            # Files sent without a caption (saved in uploads/), kept for their sender's next message in the chat.
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS telegram_held_files (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, attachment TEXT NOT NULL)"
             )
             await conn.commit()
 
@@ -72,3 +82,24 @@ class TelegramStore:
         async with aiosqlite.connect(self.db_path) as conn:
             cursor = await conn.execute("SELECT session_id FROM telegram_owned WHERE chat_id = ?", (chat_id,))
             return [row[0] for row in await cursor.fetchall()]
+
+    async def hold(self, chat_id: int, user_id: int, attachments: Sequence[Attachment]) -> None:
+        """Keep files for the user's next message in the chat."""
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.executemany(
+                "INSERT INTO telegram_held_files (chat_id, user_id, attachment) VALUES (?, ?, ?)",
+                [(chat_id, user_id, attachment.model_dump_json()) for attachment in attachments],
+            )
+            await conn.commit()
+
+    async def take(self, chat_id: int, user_id: int) -> List[Attachment]:
+        """The files kept for the user's next message in the chat, in the order they came; they are kept no longer."""
+        async with aiosqlite.connect(self.db_path) as conn:
+            cursor = await conn.execute(
+                "SELECT id, attachment FROM telegram_held_files WHERE chat_id = ? AND user_id = ? ORDER BY id",
+                (chat_id, user_id),
+            )
+            rows = await cursor.fetchall()
+            await conn.executemany("DELETE FROM telegram_held_files WHERE id = ?", [(row[0],) for row in rows])
+            await conn.commit()
+        return [Attachment.model_validate_json(row[1]) for row in rows]

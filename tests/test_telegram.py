@@ -9,6 +9,7 @@ import pytest
 
 from fakes import text_turn, tool_turn, until
 from kilo.config import Settings
+from kilo.models.session import Attachment
 from kilo.telegram import render
 from kilo.telegram.api import BotAPI, TelegramError, Unauthorized
 from kilo.telegram.bot import TelegramBot
@@ -392,6 +393,55 @@ async def test_api_waits_out_rate_limits():
         httpx.Response(200, json={"ok": True, "result": True}),
     ]
     assert await mock_api(lambda request: replies.pop(0)).call("editMessageText") is True
+
+
+HELD_PHOTO = Attachment(path="uploads/2026-11-03/photo-1.jpg", name="photo-1.jpg", type="image/jpeg", size=10)
+HELD_DOC = Attachment(path="uploads/2026-11-03/a.pdf", name="a.pdf", type="application/pdf", size=20)
+
+
+async def test_download_streams_the_file():
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.path)
+        return httpx.Response(200, content=b"photo bytes")
+
+    assert b"".join([chunk async for chunk in mock_api(handler).download("photos/file_1.jpg")]) == b"photo bytes"
+    assert seen == ["/file/bot123:SECRET/photos/file_1.jpg"]
+
+
+async def test_download_errors_never_show_the_token():
+    def missing(request):
+        return httpx.Response(404)
+
+    def down(request):
+        raise httpx.ConnectError(f"cannot reach {request.url}")
+
+    for handler, text in ((missing, "download: HTTP 404"), (down, "download: ConnectError")):
+        with pytest.raises(TelegramError) as error:
+            async for _ in mock_api(handler).download("photos/file_1.jpg"):
+                pass
+        assert str(error.value) == text and error.value.__cause__ is None
+
+
+async def test_held_files_are_taken_once_in_order(tmp_path):
+    store = TelegramStore(tmp_path / "kilo.db")
+    await store.init()
+    await store.hold(USER, USER, [HELD_PHOTO])
+    await store.hold(USER, USER, [HELD_DOC])
+    await store.hold(GROUP, USER, [HELD_DOC])
+    assert await store.take(USER, USER) == [HELD_PHOTO, HELD_DOC]
+    assert await store.take(USER, USER) == []
+    assert await store.take(GROUP, USER) == [HELD_DOC]
+
+
+async def test_held_files_outlast_the_store(tmp_path):
+    first = TelegramStore(tmp_path / "kilo.db")
+    await first.init()
+    await first.hold(USER, USER, [HELD_PHOTO])
+    again = TelegramStore(tmp_path / "kilo.db")
+    await again.init()
+    assert await again.take(USER, USER) == [HELD_PHOTO]
 
 
 # ---------------------------------------------------------------------------
