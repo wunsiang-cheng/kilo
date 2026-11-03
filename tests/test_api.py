@@ -144,7 +144,7 @@ async def test_stop_says_when_nothing_is_running(authed, session_id):
 
 
 async def test_compact_endpoint(authed, session_id, model):
-    model.turns.append(text_turn("hello"))
+    model.turns.extend([text_turn("hello"), text_turn("the summary")])
     await authed.post(f"{API}/sessions/{session_id}/chat", json={"message": "hi", "stream": False})
     assert (await authed.post(f"{API}/sessions/{session_id}/compact")).json()["event"] == "compaction_done"
 
@@ -219,7 +219,7 @@ async def test_unknown_mcp_server_404(authed):
 
 async def test_health_reports_the_setup(authed):
     body = (await authed.get(f"{API}/health")).json()
-    assert body["model"] == settings.anthropic_model
+    assert body["model"] == settings.openrouter_model
     assert body["running_tasks"] == 0 and body["schedules_enabled"] == 0
 
 
@@ -245,9 +245,19 @@ async def test_notices_stream_run_endings_and_system_turns(kilo, clock):
         await stream.__anext__()
 
 
+def test_main_refuses_to_start_without_an_api_key(monkeypatch):
+    started = []
+    monkeypatch.setattr(server.uvicorn, "run", lambda *a, **k: started.append(k))
+    monkeypatch.setattr(settings, "openrouter_api_key", None)
+    with pytest.raises(SystemExit, match="OPENROUTER_API_KEY is not set"):
+        server.main()
+    assert started == []
+
+
 def test_main_refuses_default_password_on_public_host(monkeypatch):
     started = []
     monkeypatch.setattr(server.uvicorn, "run", lambda *a, **k: started.append(a))
+    monkeypatch.setattr(settings, "openrouter_api_key", "test-key")
     monkeypatch.setattr(settings, "kilo_host", "0.0.0.0")
     monkeypatch.setattr(settings, "kilo_password", DEFAULT_PASSWORD)
     with pytest.raises(SystemExit):
@@ -258,6 +268,7 @@ def test_main_refuses_default_password_on_public_host(monkeypatch):
 def test_main_serves_on_public_host_with_own_password(monkeypatch):
     started = []
     monkeypatch.setattr(server.uvicorn, "run", lambda *a, **k: started.append(k))
+    monkeypatch.setattr(settings, "openrouter_api_key", "test-key")
     monkeypatch.setattr(settings, "kilo_host", "0.0.0.0")
     monkeypatch.setattr(settings, "kilo_password", "my-own-password")
     server.main()
@@ -267,6 +278,7 @@ def test_main_serves_on_public_host_with_own_password(monkeypatch):
 def test_main_serves_locally_with_default_password(monkeypatch):
     started = []
     monkeypatch.setattr(server.uvicorn, "run", lambda *a, **k: started.append(k))
+    monkeypatch.setattr(settings, "openrouter_api_key", "test-key")
     monkeypatch.setattr(settings, "kilo_password", DEFAULT_PASSWORD)
     server.main()
     assert started[0]["host"] == "127.0.0.1"

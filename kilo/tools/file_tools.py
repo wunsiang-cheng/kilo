@@ -33,7 +33,7 @@ READ_FILE_TOOL_DEFINITION = {
         "`truncated` and a `message` saying where to continue. Bytes that are not UTF-8 show as replacement characters. "
         "Binary files are refused."
     ),
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {
             "path": {
@@ -64,7 +64,7 @@ WRITE_FILE_TOOL_DEFINITION = {
     "description": (
         "Create a file, replace a whole file, or append to one, as UTF-8. Missing parent directories are created."
     ),
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {
             "path": {
@@ -99,7 +99,7 @@ EDIT_FILE_TOOL_DEFINITION = {
         "An empty `new_str` deletes the text. Fails and leaves the file unchanged when `old_str` is not found, when it "
         "occurs more than once and `replace_all` is false, when it equals `new_str`, or when the file is not UTF-8."
     ),
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {
             "path": {

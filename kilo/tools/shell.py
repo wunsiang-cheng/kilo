@@ -19,7 +19,7 @@ SHELL_TOOL_DEFINITION = {
         "`cd` and environment variables do not carry over to the next. Nothing can type into a command: one that waits "
         "for input runs until its timeout. A command past its `timeout` is stopped, and what it printed comes back."
     ),
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {
             "action": {

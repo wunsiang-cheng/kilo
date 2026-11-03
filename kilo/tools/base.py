@@ -8,7 +8,7 @@ from typing import Any, Awaitable, Callable, Dict, Tuple
 class Tool:
     """
     Everything Kilo knows about one built-in tool, declared in one place.
-      - definition: Anthropic tool definition (name, description, input_schema) sent to the LLM
+      - definition: OpenAI-style function definition (name, description, parameters) sent to the LLM
       - execute: coroutine taking the parsed arguments and returning a JSON string
       - aliases: alternative names the LLM may call the tool by
     """

@@ -6,8 +6,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-CONTEXT_WINDOW = 1_000_000  # tokens; every current Claude model
-MAX_OUTPUT_TOKENS = 128_000  # tokens; every current Claude model
 MIN_COMPACT_AT_TOKENS = 10_000
 MIN_TOOL_OUTPUT_CHARS = 10_000
 # The web terminal's login out of the box. Public, so it is accepted only from this computer (kilo/auth.py).
@@ -16,12 +14,11 @@ DEFAULT_PASSWORD = "9487skrskr"
 
 
 class Settings(BaseSettings):
-    # LLM Settings (Anthropic API). An unset key lets the SDK resolve credentials itself
-    # (ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, or an `ant auth login` profile).
-    anthropic_api_key: Optional[str] = None
-    anthropic_model: str = "claude-sonnet-5-5"
-    anthropic_effort: Literal["low", "medium", "high", "xhigh", "max"] = "high"
-    anthropic_max_tokens: int = Field(128000, ge=1, le=MAX_OUTPUT_TOKENS)
+    # The model, through OpenRouter. kilo-server refuses to start without the key (kilo/server/app.py).
+    openrouter_api_key: Optional[str] = None
+    openrouter_model: str = "meta/muse-spark-1.3-contributor"
+    openrouter_reasoning_effort: Literal["max", "xhigh", "high", "medium", "low", "minimal", "none"] = "high"
+    openrouter_max_tokens: Optional[int] = Field(None, ge=1)
 
     # Server Settings
     kilo_host: str = "127.0.0.1"
@@ -49,10 +46,11 @@ class Settings(BaseSettings):
     kilo_telegram_allowed_users: str = ""
     kilo_telegram_allowed_chats: str = ""
 
-    # Compaction: a conversation this large (tokens) is summarized before its next request; 0 turns it off
+    # Compaction: a conversation this large (tokens) is summarized before its next request; 0 turns it off.
+    # It should stay well below the model's context length, which differs from model to model.
     kilo_compact_at_tokens: int = 500_000
-    # Cap on one summary, thinking included; a summary cut off is retried with twice this
-    kilo_compact_max_tokens: int = Field(16_000, ge=1, le=MAX_OUTPUT_TOKENS // 2)
+    # Cap on one summary, reasoning included; a summary cut off is retried with twice this
+    kilo_compact_max_tokens: int = Field(16_000, ge=1, le=64_000)
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -130,14 +128,10 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def _compaction_fits(self) -> "Settings":
-        # The summary request carries the whole conversation, so compaction must start while it still fits.
-        ceiling = CONTEXT_WINDOW - self.anthropic_max_tokens
-        if self.kilo_compact_at_tokens and not MIN_COMPACT_AT_TOKENS <= self.kilo_compact_at_tokens <= ceiling:
-            raise ValueError(
-                f"KILO_COMPACT_AT_TOKENS must be 0 (off) or between {MIN_COMPACT_AT_TOKENS:,} and {ceiling:,} "
-                f"(the {CONTEXT_WINDOW:,}-token context window less ANTHROPIC_MAX_TOKENS)."
-            )
+    def _compaction_threshold_usable(self) -> "Settings":
+        # No upper bound: the context window is the model's, and models differ (see .env.example).
+        if self.kilo_compact_at_tokens and self.kilo_compact_at_tokens < MIN_COMPACT_AT_TOKENS:
+            raise ValueError(f"KILO_COMPACT_AT_TOKENS must be 0 (off) or at least {MIN_COMPACT_AT_TOKENS:,}.")
         return self
 
 

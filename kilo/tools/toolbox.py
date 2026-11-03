@@ -19,13 +19,13 @@ INTENT_PROPERTY = {
 
 def with_intent(definition: Dict[str, Any]) -> Dict[str, Any]:
     """A tool definition with the required `intent` parameter added (left as it is if the tool has one already)."""
-    schema = dict(definition.get("input_schema") or {})
+    schema = dict(definition.get("parameters") or {})
     properties = schema.get("properties") or {}
     if INTENT in properties:
         return definition
     schema["properties"] = {INTENT: INTENT_PROPERTY, **properties}  # first, so the call states it before its input
     schema["required"] = [INTENT, *schema.get("required", [])]
-    return {**definition, "input_schema": schema}
+    return {**definition, "parameters": schema}
 
 
 def _error(message: str) -> str:
@@ -57,9 +57,9 @@ class Toolbox:
         await self._mcp.ensure_started()
 
     def definitions(self) -> List[Dict[str, Any]]:
-        """Anthropic tool definitions of built-in tools and connected MCP tools, each taking an `intent`."""
+        """The tools array OpenRouter takes: built-in tools and connected MCP tools, each taking an intent."""
         own = [tool.definition for tool in self._tools.values()] + self._mcp.tool_definitions()
-        return [with_intent(definition) for definition in own]
+        return [{"type": "function", "function": with_intent(definition)} for definition in own]
 
     def _has_own_intent(self, name: str) -> bool:
         """Whether the tool declares an `intent` parameter of its own (then it gets the call's)."""
@@ -68,7 +68,7 @@ class Toolbox:
             definition = self._tools[canonical].definition
         else:
             definition = next((d for d in self._mcp.tool_definitions() if d["name"] == name), {})
-        return INTENT in (definition.get("input_schema") or {}).get("properties", {})
+        return INTENT in (definition.get("parameters") or {}).get("properties", {})
 
     def canonical_name(self, name: str) -> str:
         """The canonical name for a built-in tool alias; any other name is returned unchanged."""

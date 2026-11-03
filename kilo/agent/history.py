@@ -9,7 +9,7 @@ import json
 from collections import deque
 from typing import Any, Callable, Dict, List, Sequence
 
-from kilo.agent.runner import CONTINUE_AFTER_COMPACTION
+from kilo.agent.runner import CONTINUE_AFTER_COMPACTION, _parse_tool_arguments
 from kilo.models.schedule import Run
 from kilo.scheduling.launcher import is_run_message, run_started_event
 from kilo.models.session import Message, MessageRole
@@ -38,7 +38,7 @@ def history_events(
     of schedules made in the session) that it shows a notice of go between the messages by the time they ended.
     """
     events: List[Dict[str, Any]] = []
-    tool_names: Dict[str, str] = {}  # tool_use id -> the tool's name, for the result that follows
+    tool_names: Dict[str, str] = {}  # tool call id -> the tool's name, for the result that follows
     ended = deque(sorted((run for run in runs if run.shown_in_origin), key=lambda run: run.finished_at or run.started_at))
 
     for msg in messages:
@@ -52,33 +52,31 @@ def history_events(
                     "id": msg.id, "session_id": msg.session_id, "content": msg.content or "",
                 }})
 
+        elif msg.role == MessageRole.SUMMARY:
+            # The counts of the moment are not stored; the renderer says only that it happened.
+            events.append({"event": "compaction_done", "data": {}})
+
         elif msg.role == MessageRole.ASSISTANT:
-            blocks = msg.blocks if msg.blocks is not None else [{"type": "text", "text": msg.content or ""}]
-            for block in blocks:
-                kind = block.get("type")
-                if kind == "text" and block.get("text"):
-                    events.append({"event": "message_delta", "data": {"delta": block["text"]}})
-                elif kind == "thinking" and block.get("thinking"):
-                    events.append({"event": "progress", "data": {"delta": block["thinking"]}})
-                elif kind == "tool_use":
-                    name = canonical_name(block.get("name", "unknown"))
-                    tool_names[block["id"]] = name
-                    arguments = block.get("input")
-                    events.append({"event": "tool_call_start", "data": {
-                        "tool_call_id": block["id"], "name": name,
-                        "arguments": arguments if isinstance(arguments, dict) else {},
-                    }})
-                elif kind == "compaction":
-                    # The counts of the moment are not stored; the renderer says only that it happened.
-                    events.append({"event": "compaction_done", "data": {}})
+            # The turn's reasoning, then its text, then its calls: the order they stream in (when not interleaved).
+            payload = msg.payload if msg.payload is not None else {"content": msg.content}
+            if payload.get("reasoning"):
+                events.append({"event": "progress", "data": {"delta": payload["reasoning"]}})
+            if payload.get("content"):
+                events.append({"event": "message_delta", "data": {"delta": payload["content"]}})
+            for call in payload.get("tool_calls") or []:
+                function = call.get("function") or {}
+                name = canonical_name(function.get("name") or "unknown")
+                tool_names[call["id"]] = name
+                arguments, _ = _parse_tool_arguments(function.get("arguments"))
+                events.append({"event": "tool_call_start", "data": {
+                    "tool_call_id": call["id"], "name": name, "arguments": arguments,
+                }})
 
         elif msg.role == MessageRole.TOOL:
-            for block in msg.blocks or []:
-                if block.get("type") == "tool_result":
-                    call_id = block.get("tool_use_id", "")
-                    events.append({"event": "tool_call_result", "data": {
-                        "tool_call_id": call_id, "name": tool_names.get(call_id, ""), "result": _result(block.get("content")),
-                    }})
+            call_id = (msg.payload or {}).get("tool_call_id", "")
+            events.append({"event": "tool_call_result", "data": {
+                "tool_call_id": call_id, "name": tool_names.get(call_id, ""), "result": _result(msg.content),
+            }})
 
     events.extend(run_event(run) for run in ended)
     return events

@@ -40,7 +40,7 @@ GLOB_TOOL_DEFINITION = {
         f"`max_results` was reached. Folders below `directory` named {_SKIPPED} are skipped, whatever `ignore_hidden` "
         "says; to look inside one, make it the `directory`."
     ),
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {
             "pattern": {
@@ -80,7 +80,7 @@ GREP_TOOL_DEFINITION = {
         "`truncated` when `max_results` was reached. A directory search skips binary files, hidden files and folders, "
         f"and folders named {_SKIPPED}; give one of those as `path` to search it."
     ),
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {
             "pattern": {

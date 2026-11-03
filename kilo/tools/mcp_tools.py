@@ -19,7 +19,7 @@ MCP_TOOL_DEFINITION = {
         "When a task needs an external integration, 'list' first and 'add' a server only if none fits; when a stdio "
         "server fails to connect, read its 'logs'."
     ),
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {
             "action": {

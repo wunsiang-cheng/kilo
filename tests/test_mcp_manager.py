@@ -52,7 +52,7 @@ async def test_unknown_tool_is_reported(manager):
 async def test_toolbox_routes_mcp_calls(manager):
     await manager.add_server(echo_config())
     toolbox = Toolbox([], manager)
-    assert TOOL in [definition["name"] for definition in toolbox.definitions()]
+    assert TOOL in [d["function"]["name"] for d in toolbox.definitions()]
     assert json.loads(await toolbox.execute(TOOL, {"text": "hi"}))["content"] == "echo: hi"
 
 
@@ -62,19 +62,31 @@ def recording_tool(name, seen, properties=None):
         return "{}"
 
     schema = {"type": "object", "properties": properties or {"path": {"type": "string"}}, "required": ["path"]}
-    return Tool(definition={"name": name, "description": "d", "input_schema": schema}, execute=run)
+    return Tool(definition={"name": name, "description": "d", "parameters": schema}, execute=run)
 
 
 async def test_every_tool_takes_a_required_intent(manager):
     await manager.add_server(echo_config(tools=["echo"]))
     tool = recording_tool("read", [])
     definitions = Toolbox([tool], manager).definitions()
-    assert [d["name"] for d in definitions] == ["read", TOOL]
+    assert [d["type"] for d in definitions] == ["function", "function"]
+    assert [d["function"]["name"] for d in definitions] == ["read", TOOL]
     for definition in definitions:
-        schema = definition["input_schema"]
+        schema = definition["function"]["parameters"]
         assert list(schema["properties"])[0] == INTENT and schema["required"][0] == INTENT
-    assert definitions[0]["input_schema"]["required"] == [INTENT, "path"]
-    assert INTENT not in tool.definition["input_schema"]["properties"]  # the tool's own definition is left alone
+    assert definitions[0]["function"]["parameters"]["required"] == [INTENT, "path"]
+    assert INTENT not in tool.definition["parameters"]["properties"]  # the tool's own definition is left alone
+
+
+async def test_mcp_tools_are_described_with_parameters(manager):
+    await manager.add_server(echo_config())
+    definition = next(d for d in manager.tool_definitions() if d["name"] == TOOL)
+    assert set(definition) == {"name", "description", "parameters"} and definition["parameters"]["type"] == "object"
+
+
+async def test_builtin_tools_are_described_with_parameters(kilo):
+    for tool in kilo.tools:
+        assert set(tool.definition) == {"name", "description", "parameters"}, tool.name
 
 
 async def test_intent_is_not_passed_to_the_tool(manager):
@@ -91,7 +103,7 @@ async def test_a_tool_with_its_own_intent_keeps_it(manager):
     seen = []
     tool = recording_tool("plan", seen, properties={INTENT: {"type": "string", "description": "the tool's own"}})
     toolbox = Toolbox([tool], manager)
-    assert toolbox.definitions()[0] == tool.definition
+    assert toolbox.definitions()[0] == {"type": "function", "function": tool.definition}
     await toolbox.execute("plan", {INTENT: "x"})
     assert seen == [{INTENT: "x"}]
 

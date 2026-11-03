@@ -1,21 +1,20 @@
 """The agent turn loop's view of an LLM."""
 
-from typing import Any, AsyncIterator, Dict, List, Protocol
+from typing import Any, AsyncIterator, Dict, List, Optional, Protocol
 
 
 class ChatModel(Protocol):
     """
-    What the agent turn loop needs from an LLM: one streamed assistant turn per call,
-    in Anthropic Messages API shapes (system prompt, content-block messages, tool definitions).
+    What the agent turn loop needs from an LLM: one streamed assistant turn per call, in Chat Completions shapes
+    (a system prompt; user, assistant and tool messages; function tool definitions).
     stream_turn yields, in order:
       - {"type": "text", "delta": str} for each text delta
-      - {"type": "progress", "delta": str} for progress-update text between tool calls
-      - {"type": "done", "stop_reason": str, "stop_details": dict | None, "content": list, "context_tokens": int}
-        last; "content" is the turn's content blocks (thinking, text, tool_use, ...) to send back unchanged,
-        "context_tokens" the conversation's size with this turn included
-    compact summarizes the conversation instead of taking a turn: it returns {"stop_reason": "compaction",
-    "content": [compaction block], "summary_tokens": int}, or another stop_reason and no block when no
-    summary was written.
+      - {"type": "progress", "delta": str} for readable reasoning text
+      - {"type": "done", "finish_reason": str, "message": dict, "context_tokens": int | None} last;
+        "finish_reason" is "stop", "tool_calls", "length" or "content_filter"; "message" is the assistant turn
+        (content, reasoning, reasoning_details, tool_calls) to store and send back; "context_tokens" is the
+        conversation's size with this turn included
+    `max_tokens` caps this one reply (a summary's) in place of the model's configured cap.
     Failures are raised, not yielded.
     """
 
@@ -24,13 +23,5 @@ class ChatModel(Protocol):
         system: str,
         messages: List[Dict[str, Any]],
         tools: List[Dict[str, Any]],
+        max_tokens: Optional[int] = None,
     ) -> AsyncIterator[Dict[str, Any]]: ...
-
-    async def compact(
-        self,
-        system: str,
-        messages: List[Dict[str, Any]],
-        tools: List[Dict[str, Any]],
-        instructions: str,
-        max_tokens: int,
-    ) -> Dict[str, Any]: ...

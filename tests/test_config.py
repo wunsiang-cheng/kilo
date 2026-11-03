@@ -26,7 +26,7 @@ def example_values() -> dict:
 
 
 def test_example_is_parsed():
-    assert len(example_values()) > 15
+    assert len(example_values()) >= 15
 
 
 @pytest.mark.parametrize("key,value", example_values().items())
@@ -46,7 +46,7 @@ def test_tests_cannot_see_the_real_env_file():
 
 
 def test_shell_schema_states_the_configured_timeout():
-    timeout = SHELL_TOOL_DEFINITION["input_schema"]["properties"]["timeout"]
+    timeout = SHELL_TOOL_DEFINITION["parameters"]["properties"]["timeout"]
     assert timeout["default"] == settings.kilo_default_timeout
     assert str(settings.kilo_default_timeout) in timeout["description"]
 
@@ -54,7 +54,7 @@ def test_shell_schema_states_the_configured_timeout():
 def test_shell_schema_follows_the_setting():
     code = (
         "from kilo.tools.shell import SHELL_TOOL_DEFINITION as d\n"
-        "print(d['input_schema']['properties']['timeout']['default'])"
+        "print(d['parameters']['properties']['timeout']['default'])"
     )
     package_root = str(Path(kilo.__file__).resolve().parent.parent)  # this copy of Kilo, whatever is installed
     env = {**os.environ, "KILO_DEFAULT_TIMEOUT": "45", "PYTHONPATH": package_root}
@@ -87,6 +87,15 @@ def test_compaction_threshold_outside_range_is_refused():
     assert Settings(_env_file=None, kilo_compact_at_tokens=0).kilo_compact_at_tokens == 0
 
 
+def test_compaction_threshold_has_no_ceiling():
+    assert Settings(_env_file=None, kilo_compact_at_tokens=5_000_000).kilo_compact_at_tokens == 5_000_000
+
+
+def test_the_only_model_settings_are_openrouters():
+    model_settings = {name for name in Settings.model_fields if not name.startswith("kilo_")}
+    assert model_settings == {"openrouter_api_key", "openrouter_model", "openrouter_reasoning_effort", "openrouter_max_tokens"}
+
+
 def test_tool_output_limit_has_a_floor():
     with pytest.raises(ValidationError):
         Settings(_env_file=None, kilo_tool_output_max_chars=9_999)
@@ -96,10 +105,10 @@ def test_tool_output_limit_has_a_floor():
     ("kilo_password", ""), ("kilo_password", "   "), ("kilo_username", ""),
     ("kilo_timezone", "Mars/Base"), ("kilo_timezone", "Asia"),
     ("kilo_port", 0), ("kilo_port", 70_000),
-    ("anthropic_max_tokens", 0), ("anthropic_max_tokens", 128_001),
     ("kilo_compact_max_tokens", 0), ("kilo_compact_max_tokens", 64_001),
     ("kilo_default_timeout", 0), ("kilo_default_timeout", -1),
     ("kilo_job_catchup_minutes", -1),
+    ("openrouter_reasoning_effort", "bogus"), ("openrouter_max_tokens", 0),
 ])
 def test_unusable_value_is_refused(name, value):
     with pytest.raises(ValidationError):
@@ -107,11 +116,18 @@ def test_unusable_value_is_refused(name, value):
 
 
 @pytest.mark.parametrize("name,value", [
-    ("kilo_port", 1), ("kilo_port", 65_535), ("anthropic_max_tokens", 128_000), ("kilo_compact_max_tokens", 64_000),
-    ("kilo_job_catchup_minutes", 0),
+    ("kilo_port", 1), ("kilo_port", 65_535), ("kilo_compact_max_tokens", 64_000),
+    ("kilo_job_catchup_minutes", 0), ("openrouter_max_tokens", 1),
 ])
 def test_values_at_the_limits_are_accepted(name, value):
     assert getattr(Settings(_env_file=None, **{name: value}), name) == value
+
+
+def test_openrouter_defaults():
+    defaults = Settings(_env_file=None)
+    assert defaults.openrouter_model == "meta/muse-spark-1.3-contributor"
+    assert defaults.openrouter_reasoning_effort == "high"
+    assert defaults.openrouter_api_key is None and defaults.openrouter_max_tokens is None
 
 
 def test_line_settings_refuse_an_unknown_timezone():

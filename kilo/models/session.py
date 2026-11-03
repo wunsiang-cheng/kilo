@@ -14,6 +14,7 @@ class MessageRole(str, Enum):
     USER = "user"
     ASSISTANT = "assistant"
     TOOL = "tool"
+    SUMMARY = "summary"  # what a compaction left of the conversation before it
 
 
 class Message(BaseModel):
@@ -21,9 +22,9 @@ class Message(BaseModel):
     session_id: str
     role: MessageRole
     content: Optional[str] = None
-    # Anthropic content blocks sent to the model: the assistant turn's blocks as returned,
-    # or a tool message's tool_result block. None means plain-text content.
-    blocks: Optional[List[Dict[str, Any]]] = None
+    # The message as sent to OpenRouter (Chat Completions shape): an assistant turn as returned, or a tool result.
+    # None for user messages and summaries.
+    payload: Optional[Dict[str, Any]] = None
     created_at: datetime = Field(default_factory=utc_now)
 
 

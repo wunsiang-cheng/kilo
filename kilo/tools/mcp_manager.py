@@ -421,7 +421,7 @@ class MCPManager:
         return exposed_name in self._tool_index
 
     def tool_definitions(self) -> List[Dict[str, Any]]:
-        """Anthropic tool definitions for every connected MCP tool."""
+        """OpenAI-style function definitions for every connected MCP tool."""
         definitions = []
         for exposed, (server_name, tool_name) in self._tool_index.items():
             conn = self.connections[server_name]
@@ -435,7 +435,7 @@ class MCPManager:
             definitions.append({
                 "name": exposed,
                 "description": f"[MCP server: {server_name}] {description}",
-                "input_schema": schema,
+                "parameters": schema,
             })
         return definitions
 
