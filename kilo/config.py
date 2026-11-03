@@ -33,6 +33,8 @@ class Settings(BaseSettings):
     # Largest tool result the model sees (characters, about 4 per token); longer ones are shortened and saved
     # in full under <data dir>/tool-output.
     kilo_tool_output_max_chars: int = 100_000
+    # Largest file accepted from the web terminal or Telegram, in MB of 1024 x 1024 bytes (saved in uploads/).
+    kilo_upload_max_mb: int = Field(500, ge=1)
     kilo_mcp_config: Path = Path(".kilo_data/mcp_servers.json")  # unset: mcp_servers.json in the data dir
 
     # Scheduled jobs
