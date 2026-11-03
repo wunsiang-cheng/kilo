@@ -12,8 +12,9 @@ from kilo.agent.runner import (
     COMPACTION_INSTRUCTIONS, COMPACTION_RETRY_TOKENS, CONTINUE_AFTER_COMPACTION, INTERRUPTED_TOOL_RESULT, SUMMARY_HEADER,
     _api_messages,
 )
+from kilo import uploads
 from kilo.config import settings
-from kilo.models.session import MessageRole
+from kilo.models.session import Attachment, MessageRole
 
 
 async def collect(kilo, session_id, text, **options):
@@ -342,3 +343,68 @@ async def test_every_stored_result_is_json_the_model_can_read(kilo, model, sessi
     await collect(kilo, session.id, "go")
     tool_message = [m for m in await kilo.db.get_messages(session.id) if m.role == MessageRole.TOOL][0]
     assert json.loads(tool_message.content)["status"] == "success"
+
+
+# ---------------------------------------------------------------------------
+# Files sent with a message
+
+PHOTO = Attachment(path="uploads/2026-11-03/photo.jpg", name="photo.jpg", type="image/jpeg", size=2048)
+
+
+async def test_files_sent_are_stored_and_described_to_the_model(kilo, model, session):
+    model.turns.append(text_turn("ok"))
+    events = await collect(kilo, session.id, "what is this?", attachments=[PHOTO])
+    [stored] = [m for m in await kilo.db.get_messages(session.id) if m.role == MessageRole.USER]
+    assert stored.content == "what is this?"
+    assert stored.payload == {"attachments": [PHOTO.model_dump()]}
+    assert model.requests[0][-1] == {"role": "user", "content": f"what is this?\n\n{uploads.note([PHOTO])}"}
+    assert events[0]["data"]["attachments"] == [PHOTO.model_dump()]
+
+
+async def test_files_alone_are_sent_as_their_note_and_title_the_session(kilo, model, session):
+    model.turns.append(text_turn("ok"))
+    await collect(kilo, session.id, "", attachments=[PHOTO])
+    assert model.requests[0][-1]["content"] == uploads.note([PHOTO])
+    assert (await kilo.db.get_session(session.id)).title == "photo.jpg"
+
+
+async def test_a_message_without_files_has_none(kilo, model, session):
+    model.turns.append(text_turn("ok"))
+    events = await collect(kilo, session.id, "hi")
+    assert events[0]["data"]["attachments"] == []
+    assert (await kilo.db.get_messages(session.id))[0].payload is None
+
+
+async def test_history_shows_the_files_sent(kilo, model, session):
+    model.turns.append(text_turn("ok"))
+    await collect(kilo, session.id, "look", attachments=[PHOTO])
+    replayed = history_events(await kilo.db.get_messages(session.id), kilo.toolbox.canonical_name)
+    assert replayed[0]["data"]["attachments"] == [PHOTO.model_dump()]
+
+
+def test_history_of_a_message_without_files_lists_none():
+    message = SimpleNamespace(role=MessageRole.USER, created_at=None, content="hi", payload=None, id="m", session_id="s")
+    assert history_events([message])[0]["data"]["attachments"] == []
+
+
+def test_the_system_prompt_says_where_files_go(kilo):
+    assert (
+        "Files the user sends you are saved in `uploads/` (a folder per day); each one is listed in the message it came with."
+        in kilo.runner._system_prompt()
+    )
+
+
+def test_a_summary_keeps_the_files_sent():
+    assert "- Files the user sent, with their paths." in COMPACTION_INSTRUCTIONS
+
+
+async def test_the_note_counts_toward_compaction(kilo, model, session, monkeypatch):
+    monkeypatch.setattr(settings, "kilo_compact_at_tokens", 10_000)
+    await kilo.db.add_message(session.id, MessageRole.USER, content="old question")
+    await kilo.db.add_message(
+        session.id, MessageRole.ASSISTANT, content="old answer", payload={"role": "assistant", "content": "old answer"},
+    )
+    await kilo.db.update_session(session.id, metadata={"context_tokens": 9_990})  # "hi" alone stays below it
+    model.turns.extend([text_turn("the summary"), text_turn("ok")])
+    events = await collect(kilo, session.id, "hi", attachments=[PHOTO])
+    assert names(events)[:2] == ["compaction_start", "compaction_done"]

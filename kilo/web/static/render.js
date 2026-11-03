@@ -36,6 +36,24 @@ function seconds(task) {
 const errorLine = (text) => ({ text, cls: "err" });
 const indent = (text) => text.replace(/\s+$/, "").split("\n").map((line) => `  ${line}`).join("\n");
 
+// A file size for people, as the server writes it for the model (kilo/uploads.py format_size).
+export function formatSize(bytes) {
+  if (bytes < 1024) return `${bytes} bytes`;
+  let value = bytes / 1024;
+  let unit = "KB";
+  for (const bigger of ["MB", "GB"]) {
+    if (value < 1024) break;
+    value /= 1024;
+    unit = bigger;
+  }
+  return `${value.toFixed(1)} ${unit}`;
+}
+
+// A file sent with a message, under the message.
+export function attachmentLine(attachment) {
+  return `  📎 ${attachment.path} (${formatSize(attachment.size)})`;
+}
+
 // ---------------------------------------------------------------------------
 // API data
 
@@ -47,6 +65,8 @@ export function help() {
     ["/session info", "Show current session details and message count"],
     ["/session rename <title>", "Rename the current session"],
     ["/session delete <id>", "Delete a session and its message history"],
+    ["/upload", "Attach files to your next message (or drop them on the page, or paste them)"],
+    ["/upload clear", "Forget the files waiting to be sent (they stay in uploads/)"],
     ["/compact", "Summarize the current session's history now, to free its context"],
     ["/tasks", "List recent tasks"],
     ["/task logs <id> [tail]", "View task stdout/stderr logs (default tail=50)"],

@@ -2,7 +2,7 @@
 // Everything is written as text (textContent / text nodes), never as HTML: the agent's output and
 // LINE messages are untrusted, and a script injected into this page could use the agent's shell.
 
-import { compactionLine, runNotice, runStartedNotice, toolCallLine, toolFailed } from "./render.js";
+import { attachmentLine, compactionLine, runNotice, runStartedNotice, toolCallLine, toolFailed } from "./render.js";
 
 const HISTORY_KEY = "kilo.history";
 const HISTORY_SIZE = 500;
@@ -342,6 +342,8 @@ export class ChatView {
       case "user_message":
         this.end();
         if (replay) this.term.echo(this.term.promptLabel || "kilo>", data.content || "");
+        // The files sent with it: live, this event comes as soon as the server has taken the message.
+        for (const attachment of data.attachments || []) this.term.line(attachmentLine(attachment), "dim");
         break;
       case "progress":
         this.stream("progress", "... ", "progress", data.delta || "");

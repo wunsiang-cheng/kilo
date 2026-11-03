@@ -1,10 +1,12 @@
 """What the bot says, as plain text (no parse mode: the agent's output is shown as written)."""
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Sequence
 from zoneinfo import ZoneInfo
 
 from kilo.config import settings
 from kilo.models.schedule import Run
+from kilo.models.session import Attachment
+from kilo.uploads import format_size
 
 # Longest message Telegram takes, in UTF-16 code units.
 MESSAGE_LIMIT = 4096
@@ -139,3 +141,37 @@ def run_started(content: str) -> str:
 
 def sessions_list(count: int) -> str:
     return "Sessions, most recent first (▶ current):" if count else "No sessions yet."
+
+
+# ---------------------------------------------------------------------------
+# Files
+
+UNSUPPORTED = "Only text and files are supported."
+
+
+def _sized(label: str, size: Optional[int]) -> str:
+    return f"{label} ({format_size(size)})" if size is not None else label
+
+
+def saved(attachments: Sequence[Attachment]) -> str:
+    """Files sent without a caption, saved and kept for the sender's next message."""
+    if len(attachments) == 1:
+        return f"📎 Saved {_sized(attachments[0].name, attachments[0].size)}. It goes to the agent with your next message."
+    total = format_size(sum(attachment.size for attachment in attachments))
+    return f"📎 Saved {len(attachments)} files ({total}). They go to the agent with your next message."
+
+
+def too_big(label: str, size: Optional[int]) -> str:
+    """A file past what a bot may fetch from Telegram (size None: Telegram said so, the message did not)."""
+    return (
+        f"{_sized(label, size)} is too big for a Telegram bot, which can only fetch files up to 20 MB. "
+        "Send it from the web terminal instead."
+    )
+
+
+def over_limit(label: str, size: Optional[int], limit_mb: int) -> str:
+    return f"{_sized(label, size)} is larger than the upload limit of {limit_mb} MB (KILO_UPLOAD_MAX_MB)."
+
+
+def not_fetched(label: str, reason: str) -> str:
+    return f"Could not fetch {label} from Telegram ({reason}). Send it again."

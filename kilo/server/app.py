@@ -19,6 +19,7 @@ from kilo.server.routes.notices import router as notices_router
 from kilo.server.routes.approvals import router as approvals_router
 from kilo.server.routes.sessions import router as sessions_router
 from kilo.server.routes.tasks import router as tasks_router
+from kilo.server.routes.uploads import router as uploads_router
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,7 @@ app.add_middleware(LoginRequired)
 # Register API routes
 app.include_router(auth_router, prefix="/api/v1")
 app.include_router(sessions_router, prefix="/api/v1")
+app.include_router(uploads_router, prefix="/api/v1")
 app.include_router(tasks_router, prefix="/api/v1")
 app.include_router(mcp_router, prefix="/api/v1")
 app.include_router(approvals_router, prefix="/api/v1")

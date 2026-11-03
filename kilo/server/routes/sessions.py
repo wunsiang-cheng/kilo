@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Query
 from sse_starlette.sse import EventSourceResponse
 
+from kilo import uploads
 from kilo.agent.history import history_events
 from kilo.assembly import get_kilo
 from kilo.models.api import ChatRequest
@@ -115,12 +116,17 @@ async def chat_session(session_id: str, req: ChatRequest):
     if not session:
         raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
 
-    if not req.message.strip():
+    if not req.message.strip() and not req.attachments:
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
+    try:
+        # Each must be a file in uploads/; its size is read from the disk, whatever the request says.
+        attachments = [uploads.attachment_at(a.path, a.name, a.type) for a in req.attachments]
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     if req.stream:
         async def event_generator():
-            async for ev in runner.run_chat_stream(session_id=session_id, user_message=req.message):
+            async for ev in runner.run_chat_stream(session_id=session_id, user_message=req.message, attachments=attachments):
                 yield {
                     "event": ev["event"],
                     "data": json.dumps(ev["data"]),
@@ -131,7 +137,7 @@ async def chat_session(session_id: str, req: ChatRequest):
         # Non-streaming collection
         events = []
         final_content = ""
-        async for ev in runner.run_chat_stream(session_id=session_id, user_message=req.message):
+        async for ev in runner.run_chat_stream(session_id=session_id, user_message=req.message, attachments=attachments):
             events.append(ev)
             if ev["event"] == "done":
                 final_content = ev["data"].get("content", "")

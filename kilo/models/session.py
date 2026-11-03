@@ -17,13 +17,22 @@ class MessageRole(str, Enum):
     SUMMARY = "summary"  # what a compaction left of the conversation before it
 
 
+class Attachment(BaseModel):
+    """A file the user sent, saved in uploads/ (kilo/uploads.py)."""
+
+    path: str  # relative to the workspace, with / separators
+    name: str  # as the sender named it
+    type: str
+    size: int  # bytes
+
+
 class Message(BaseModel):
     id: str
     session_id: str
     role: MessageRole
     content: Optional[str] = None
     # The message as sent to OpenRouter (Chat Completions shape): an assistant turn as returned, or a tool result.
-    # None for user messages and summaries.
+    # For a user message, the files sent with it ({"attachments": [...]}), when there are any. None otherwise.
     payload: Optional[Dict[str, Any]] = None
     created_at: datetime = Field(default_factory=utc_now)
 

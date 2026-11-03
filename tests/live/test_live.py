@@ -5,6 +5,7 @@ Real OpenRouter API calls, with the key from the project's `.env`. They cost a l
 """
 
 import os
+import secrets
 import socket
 import subprocess
 import sys
@@ -138,3 +139,23 @@ def test_real_server_process(real_server):
         ).json()
         assert "tool_call_result" in [event["event"] for event in tooled["events"]], tooled["events"][-1]
         assert "KILO-OK" in tooled["response"]
+
+
+def test_real_upload_is_read_not_sent(real_server):
+    """The code word is only in the file; the request has only its path, so the model must read the file to answer."""
+    word = f"MANGO-{secrets.token_hex(3).upper()}"
+    with httpx.Client(base_url=real_server, timeout=180) as http:
+        login = http.post("/api/v1/auth/login", json={"username": DEFAULT_USERNAME, "password": DEFAULT_PASSWORD})
+        assert login.status_code == 200
+        attachment = http.post(
+            "/api/v1/uploads", params={"name": "code.txt"}, content=f"The code word is {word}.\n".encode(),
+            headers={"content-type": "text/plain"},
+        ).json()
+        session = http.post("/api/v1/sessions").json()
+        reply = http.post(f"/api/v1/sessions/{session['id']}/chat", json={
+            "message": "What is the code word in the file I sent? Reply with the code word only.",
+            "attachments": [attachment], "stream": False,
+        }).json()
+    calls = {event["data"]["name"] for event in reply["events"] if event["event"] == "tool_call_start"}
+    assert calls & {"read_file", "shell"}, reply["events"]
+    assert word in reply["response"]

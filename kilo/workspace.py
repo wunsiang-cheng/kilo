@@ -29,4 +29,5 @@ def prompt_section() -> str:
     """System-prompt text describing the workspace."""
     return f"""Workspace:
 Your working directory is `{root()}`. Relative paths in file tools, `glob`, `grep` and `shell` resolve there; absolute paths work anywhere.
+Files the user sends you are saved in `uploads/` (a folder per day); each one is listed in the message it came with.
 """

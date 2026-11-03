@@ -4,7 +4,9 @@ in private chats and in the groups listed in KILO_TELEGRAM_ALLOWED_CHATS (it lea
 else is ignored, and never reaches the agent. In a group it answers commands, mentions and replies to it, and
 uses only the group's own sessions, since everyone there sees what it says. Each chat has a current session
 (shared with the web terminal).
-A message is a turn there; messages sent while one runs wait for it. A turn shows as one status message that
+A message is a turn there; messages sent while one runs wait for it. Files are saved in uploads/ (kilo/uploads.py)
+and go to the agent as where they are: with their caption, or, without one, with their sender's next message.
+A turn shows as one status message that
 lists its tool calls as they happen, then the final reply. The turns the system starts in a session the chat
 used (scheduled runs) show the same way, and a schedule the agent proposes comes with Approve / Reject buttons.
 """
@@ -16,10 +18,16 @@ import re
 import time
 from contextlib import aclosing
 from dataclasses import dataclass, field
-from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
+from datetime import datetime
+from pathlib import PurePosixPath
+from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
+from zoneinfo import ZoneInfo
 
+from kilo import uploads
 from kilo.agent.runner import AgentRunner, is_stop
+from kilo.config import settings
 from kilo.models.schedule import Run, Schedule
+from kilo.models.session import Attachment
 from kilo.scheduling.announcer import RunAnnouncer
 from kilo.scheduling.scheduler import ScheduleError, Scheduler, describe
 from kilo.storage.db import Database
@@ -37,6 +45,16 @@ LINE_LIMIT = 1000  # longest status line
 SESSIONS_SHOWN = 10
 NO_PREVIEW = {"is_disabled": True}
 GROUP_TYPES = ("group", "supergroup")
+TELEGRAM_FILE_LIMIT = 20 * 1024 * 1024  # the largest file a bot may fetch from Telegram
+ALBUM_SECONDS = 1.0  # an album (its items come as messages of their own) is whole once no more of it came this long
+# The fields of a message that carry a file, in the order they are looked at (an animation comes with a document too).
+FILE_FIELDS = ("animation", "document", "photo", "video", "audio", "voice", "video_note")
+# How a file that came without a name is named (then the time and the extension Telegram gives), and spoken of.
+FILE_PREFIXES = {"video_note": "video-note"}
+FILE_LABELS = {
+    "animation": "The animation", "document": "The document", "photo": "The photo", "video": "The video",
+    "audio": "The audio file", "voice": "The voice message", "video_note": "The video message",
+}
 
 
 def is_group(chat_id: int) -> bool:
@@ -58,6 +76,34 @@ def proposal_tag(schedule: Schedule) -> str:
     """Names the proposal a button answers, so a button for one the agent has since replaced does nothing."""
     pending = schedule.pending.model_dump_json() if schedule.pending else ""
     return hashlib.sha256(pending.encode()).hexdigest()[:8]
+
+
+@dataclass(frozen=True)
+class TelegramFile:
+    """A file a message carries, as Telegram describes it."""
+
+    kind: str  # the message field it came in
+    file_id: str
+    name: Optional[str]
+    mime_type: Optional[str]
+    size: Optional[int]
+
+    @property
+    def label(self) -> str:
+        """How a reply speaks of it."""
+        return self.name or FILE_LABELS[self.kind]
+
+
+def file_of(message: Dict[str, Any]) -> Optional[TelegramFile]:
+    """The file a message carries, if any; of a photo's sizes, the largest (the last)."""
+    for kind in FILE_FIELDS:
+        item = message.get(kind)
+        if not item:
+            continue
+        if kind == "photo":
+            item = item[-1]
+        return TelegramFile(kind, item["file_id"], item.get("file_name"), item.get("mime_type"), item.get("file_size"))
+    return None
 
 
 class StatusMessage:
@@ -154,7 +200,8 @@ class TurnView:
 class Chat:
     """A chat's messages waiting for a turn, and the turn running."""
 
-    queue: "asyncio.Queue[Tuple[str, str, Optional[int]]]" = field(default_factory=asyncio.Queue)  # (session id, text, message id)
+    # (session id, text, message id, files sent with it)
+    queue: "asyncio.Queue[Tuple[str, str, Optional[int], List[Attachment]]]" = field(default_factory=asyncio.Queue)
     worker: Optional[asyncio.Task] = None
     turn: Optional[asyncio.Task] = None
     turn_session: Optional[str] = None
@@ -162,6 +209,30 @@ class Chat:
     @property
     def busy(self) -> bool:
         return self.worker is not None and not self.worker.done()
+
+
+@dataclass
+class Intake:
+    """
+    A chat's messages with text or files, taken in the order they came: a text waits for files sent before it that
+    are still downloading, so it takes them along. Commands and buttons do not wait here.
+    """
+
+    queue: "asyncio.Queue[Any]" = field(default_factory=asyncio.Queue)
+    worker: Optional[asyncio.Task] = None
+
+    @property
+    def busy(self) -> bool:
+        return self.worker is not None and not self.worker.done()
+
+
+@dataclass
+class Album:
+    """The messages of one media group (an album), gathered until no more of it come for a moment."""
+
+    messages: List[Dict[str, Any]]
+    complete: asyncio.Event = field(default_factory=asyncio.Event)
+    timer: Optional[asyncio.Task] = None
 
 
 class TelegramBot:
@@ -176,13 +247,16 @@ class TelegramBot:
         allowed_users: FrozenSet[int],
         allowed_chats: FrozenSet[int] = frozenset(),
         edit_seconds: float = EDIT_SECONDS,
+        album_seconds: float = ALBUM_SECONDS,
     ):
         self.api, self.store, self.db, self.runner = api, store, db, runner
         self.scheduler, self.announcer = scheduler, announcer
         self.allowed_users, self.allowed_chats = allowed_users, allowed_chats
-        self.edit_seconds = edit_seconds
+        self.edit_seconds, self.album_seconds = edit_seconds, album_seconds
         self.me: Dict[str, Any] = {}  # the bot itself (getMe), to tell what in a group is meant for it
         self._chats: Dict[int, Chat] = {}
+        self._intakes: Dict[int, Intake] = {}
+        self._albums: Dict[Tuple[int, str], Album] = {}  # (chat id, media group id) -> the album still gathering
         self._runs: Dict[str, TurnView] = {}  # session id -> the view of the system turn running there
         self._asked: Set[Tuple[str, str]] = set()  # (schedule id, proposal tag) of the proposals shown with buttons
         self._tasks: Set[asyncio.Task] = set()
@@ -273,27 +347,23 @@ class TelegramBot:
             if chat_id not in self.allowed_chats:
                 await self._leave(chat)
                 return
-            if not self._meant_for_me(message):
-                return
+            if not message.get("media_group_id") and not self._meant_for_me(message):
+                return  # an album is judged whole, once gathered (only one of its items may mention the bot)
         elif chat.get("type") != "private":
             return
         if sender.get("id") not in self.allowed_users:
             logger.info("Telegram message from user %s ignored: not in KILO_TELEGRAM_ALLOWED_USERS.", sender.get("id"))
             return
         text = message.get("text")
-        if text is None:
-            await self.say(chat_id, "Only text messages are supported for now.", reply=self._reply(message))
-        elif text.startswith("/"):
+        if text is not None and text.startswith("/"):
             command, _, _ = text[1:].partition(" ")
             name, _, target = command.partition("@")
             if not target or target.lower() == (self.me.get("username") or "").lower():
                 await self._command(chat_id, name.lower())
+        elif text is None and file_of(message) is None:
+            await self.say(chat_id, render.UNSUPPORTED, reply=self._reply(message))
         else:
-            if is_group(chat_id):
-                text = self._unmention(text)
-                text = f"{text}\n\n[Sent by {person(sender)} in the Telegram group \"{chat.get('title') or chat_id}\"]"
-            if text.strip():
-                await self._enqueue(chat_id, text, self._reply(message))
+            await self._take_in(chat_id, message)
 
     def _meant_for_me(self, message: Dict[str, Any]) -> bool:
         """In a group: a command, a mention of the bot, or a reply to one of its messages."""
@@ -309,6 +379,124 @@ class TelegramBot:
     def _unmention(self, text: str) -> str:
         username = self.me.get("username")
         return re.sub(rf"@{re.escape(username)}\b", "", text, flags=re.IGNORECASE).strip() if username else text
+
+    def _signed(self, message: Dict[str, Any], text: str) -> str:
+        """A group message's text, saying who sent it and where."""
+        chat = message.get("chat") or {}
+        sender = person(message.get("from") or {})
+        return f"{text}\n\n[Sent by {sender} in the Telegram group \"{chat.get('title') or chat.get('id')}\"]"
+
+    # ------------------------------------------------------------------
+    # Messages with text or files
+
+    async def _take_in(self, chat_id: int, message: Dict[str, Any]) -> None:
+        """A message with text or files: taken in now when nothing sent before it is still being taken in, else after."""
+        item: Any = message
+        group_id = message.get("media_group_id")
+        if group_id is not None:
+            key = (chat_id, group_id)
+            album = self._albums.get(key)
+            if album is not None:  # more of an album still gathering, already in line
+                album.messages.append(message)
+                album.timer.cancel()
+                album.timer = self._spawn(self._close_album(key, album))
+                return
+            item = self._albums[key] = Album([message])  # in line from its first item, so later texts wait for it
+            item.timer = self._spawn(self._close_album(key, item))
+        intake = self._intakes.setdefault(chat_id, Intake())
+        if "text" in message and not intake.busy:
+            await self._take(chat_id, message)  # a text with nothing before it: at once, as ever
+            return
+        intake.queue.put_nowait(item)
+        if not intake.busy:
+            intake.worker = self._spawn(self._take_all(chat_id, intake))
+
+    async def _take_all(self, chat_id: int, intake: Intake) -> None:
+        while not intake.queue.empty():
+            item = intake.queue.get_nowait()
+            try:
+                await self._take(chat_id, item)
+            except Exception:
+                logger.exception("Telegram message in chat %s not taken in", chat_id)
+
+    async def _close_album(self, key: Tuple[int, str], album: Album) -> None:
+        await asyncio.sleep(self.album_seconds)
+        self._albums.pop(key, None)
+        album.complete.set()
+
+    async def _take(self, chat_id: int, item: Any) -> None:
+        """
+        A message, or an album once whole. A text goes to the agent with the files its sender has waiting. Files
+        are saved in uploads/ first: with a caption they go to the agent with it, without one they wait for their
+        sender's next message.
+        """
+        if isinstance(item, Album):
+            await item.complete.wait()
+            messages = item.messages
+        else:
+            messages = [item]
+        first = messages[0]  # an album's sender, and the message a reply answers
+        sender, reply = first.get("from") or {}, self._reply(first)
+        if "text" in first:
+            text = self._signed(first, self._unmention(first["text"])) if is_group(chat_id) else first["text"]
+            if text.strip():
+                await self._accept(chat_id, sender, text, [], reply)
+            return
+        if is_group(chat_id) and not any(self._meant_for_me(m) for m in messages):
+            return  # an album none of which is meant for the bot
+        caption = next((m["caption"] for m in messages if m.get("caption")), "")
+        if is_group(chat_id):
+            caption = self._unmention(caption)  # a caption that only mentions the bot is no text
+        text = (self._signed(first, caption) if is_group(chat_id) else caption) if caption.strip() else ""
+        attachments: List[Attachment] = []
+        for found in filter(None, map(file_of, messages)):
+            attachment = await self._fetch(chat_id, found, reply)
+            if attachment is not None:
+                attachments.append(attachment)
+        if text:
+            await self._accept(chat_id, sender, text, attachments, reply)
+        elif attachments:
+            await self.store.hold(chat_id, sender.get("id"), attachments)
+            await self.say(chat_id, render.saved(attachments), reply=reply)
+
+    async def _accept(
+        self, chat_id: int, sender: Dict[str, Any], text: str, files: List[Attachment], reply: Optional[int],
+    ) -> None:
+        """A message for the agent, with the files its sender has waiting in the chat, then its own."""
+        held = await self.store.take(chat_id, sender.get("id"))
+        await self._enqueue(chat_id, text, reply, [*held, *files])
+
+    async def _fetch(self, chat_id: int, file: TelegramFile, reply: Optional[int]) -> Optional[Attachment]:
+        """
+        A file from Telegram, saved in uploads/. None, after a reply saying why, when it is too big to fetch or to
+        keep, or fetching it failed.
+        """
+        if file.size is not None and file.size > TELEGRAM_FILE_LIMIT:
+            await self.say(chat_id, render.too_big(file.label, file.size), reply=reply)
+            return None
+        if file.size is not None and file.size > uploads.max_bytes():
+            await self.say(chat_id, render.over_limit(file.label, file.size, settings.kilo_upload_max_mb), reply=reply)
+            return None
+        try:
+            file_path = (await self.api.call("getFile", file_id=file.file_id) or {}).get("file_path")
+            if not file_path:  # getFile gave no path to fetch it from: treated as past what a bot may fetch
+                await self.say(chat_id, render.too_big(file.label, None), reply=reply)
+                return None
+            name = file.name or (
+                f"{FILE_PREFIXES.get(file.kind, file.kind)}-{datetime.now(ZoneInfo(settings.kilo_timezone)):%H%M%S}"
+                f"{PurePosixPath(file_path).suffix}"
+            )
+            return await uploads.save(self.api.download(file_path), name, file.mime_type)
+        except uploads.UploadTooLarge:
+            await self.say(chat_id, render.over_limit(file.label, None, settings.kilo_upload_max_mb), reply=reply)
+        except TelegramError as e:
+            if "file is too big" in str(e):
+                await self.say(chat_id, render.too_big(file.label, None), reply=reply)
+            else:
+                await self.say(chat_id, render.not_fetched(file.label, str(e)), reply=reply)
+        except OSError as e:
+            await self.say(chat_id, render.not_fetched(file.label, str(e)), reply=reply)
+        return None
 
     @staticmethod
     def _reply(message: Dict[str, Any]) -> Optional[int]:
@@ -414,9 +602,11 @@ class TelegramBot:
         await self.store.use(chat_id, session_id)
         return session_id
 
-    async def _enqueue(self, chat_id: int, text: str, reply: Optional[int] = None) -> None:
+    async def _enqueue(
+        self, chat_id: int, text: str, reply: Optional[int] = None, attachments: Sequence[Attachment] = (),
+    ) -> None:
         chat = self._chats.setdefault(chat_id, Chat())
-        chat.queue.put_nowait((await self._session(chat_id), text, reply))
+        chat.queue.put_nowait((await self._session(chat_id), text, reply, list(attachments)))
         if chat.busy:
             await self.say(chat_id, "⏳ Queued: it runs after the reply in progress.", reply=reply)
         else:
@@ -424,9 +614,9 @@ class TelegramBot:
 
     async def _work(self, chat_id: int, chat: Chat) -> None:
         while not chat.queue.empty():
-            session_id, text, reply = chat.queue.get_nowait()
+            session_id, text, reply, attachments = chat.queue.get_nowait()
             chat.turn_session = session_id
-            chat.turn = asyncio.create_task(self._turn(chat_id, session_id, text, reply))
+            chat.turn = asyncio.create_task(self._turn(chat_id, session_id, text, reply, attachments))
             try:
                 await chat.turn
             except Exception:
@@ -434,11 +624,14 @@ class TelegramBot:
             finally:
                 chat.turn, chat.turn_session = None, None
 
-    async def _turn(self, chat_id: int, session_id: str, text: str, reply: Optional[int] = None) -> None:
+    async def _turn(
+        self, chat_id: int, session_id: str, text: str, reply: Optional[int] = None, attachments: Sequence[Attachment] = (),
+    ) -> None:
         view = TurnView(self, chat_id, reply=reply)
         typing = asyncio.create_task(self._typing(chat_id))
         try:
-            async with aclosing(self.runner.run_chat_stream(session_id=session_id, user_message=text)) as events:
+            turn = self.runner.run_chat_stream(session_id=session_id, user_message=text, attachments=attachments)
+            async with aclosing(turn) as events:
                 async for event in events:
                     await view.show(event)
         except asyncio.CancelledError as e:

@@ -2,19 +2,22 @@
 
 import asyncio
 import json
-from typing import Any, Dict, List
+import re
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
 import pytest
 
 from fakes import text_turn, tool_turn, until
-from kilo.config import Settings
+from kilo.config import Settings, settings
+from kilo.models.session import Attachment
 from kilo.telegram import render
 from kilo.telegram.api import BotAPI, TelegramError, Unauthorized
 from kilo.telegram.bot import TelegramBot
 from kilo.telegram.store import TelegramStore
 
 USER = 42
+FRIEND = 43
 STRANGER = 7
 GROUP = -100
 BOT_ID = 999
@@ -27,6 +30,10 @@ class FakeAPI:
         self.calls: List[tuple] = []
         self.updates: asyncio.Queue = asyncio.Queue()
         self._next_id = 100
+        self.files: Dict[str, Tuple[str, bytes]] = {}  # file id -> (file path, content), for getFile and download
+        self.too_big: Set[str] = set()  # file ids getFile refuses as too big
+        self.broken: Set[str] = set()  # file ids whose download fails
+        self.gate: Optional[asyncio.Event] = None  # downloads wait for it while it is set and closed
 
     async def call(self, method: str, http_timeout: float = 30.0, **params: Any) -> Any:
         self.calls.append((method, params))
@@ -37,7 +44,24 @@ class FakeAPI:
         if method == "sendMessage":
             self._next_id += 1
             return {"message_id": self._next_id}
+        if method == "getFile":
+            if params["file_id"] in self.too_big:
+                raise TelegramError("getFile: Bad Request: file is too big", 400)
+            return {"file_id": params["file_id"], "file_path": self.files[params["file_id"]][0]}
         return True
+
+    def add_file(self, file_id: str, file_path: str, content: bytes) -> None:
+        self.files[file_id] = (file_path, content)
+
+    async def download(self, file_path: str):
+        if self.gate is not None:
+            await self.gate.wait()
+        file_id = next(i for i, (path, _) in self.files.items() if path == file_path)
+        if file_id in self.broken:
+            raise TelegramError("download: ConnectError")
+        content = self.files[file_id][1]
+        for start in range(0, len(content), 4):
+            yield content[start:start + 4]
 
     async def close(self) -> None:
         pass
@@ -59,7 +83,7 @@ async def api():
 async def bot(kilo, api, tmp_path):
     built = TelegramBot(
         api, TelegramStore(tmp_path / "kilo.db"), kilo.db, kilo.runner, kilo.scheduler, kilo.run_announcer,
-        frozenset({USER}), frozenset({GROUP}), edit_seconds=0,
+        frozenset({USER, FRIEND}), frozenset({GROUP}), edit_seconds=0, album_seconds=0.05,
     )
     await built.store.init()
     built.me = {"id": BOT_ID, "username": "kilo_bot"}
@@ -89,7 +113,22 @@ def group(text=None, user=USER, **extra) -> Dict[str, Any]:
     return message(text, user=user, chat_type="supergroup", chat_id=GROUP, **extra)
 
 
+def photo(file_id: str = "p1", size: int = 8) -> List[Dict[str, Any]]:
+    return [{"file_id": f"{file_id}-small", "file_size": 2}, {"file_id": file_id, "file_size": size}]
+
+
+def document(file_id="d1", name="report.pdf", size=6, mime="application/pdf") -> Dict[str, Any]:
+    item = {"file_id": file_id, "file_name": name, "mime_type": mime}
+    if size is not None:
+        item["file_size"] = size
+    return item
+
+
 async def idle(bot: TelegramBot) -> None:
+    """Waits until every message sent so far is taken in, and every turn they started has ended."""
+    for intake in list(bot._intakes.values()):
+        if intake.worker is not None:
+            await intake.worker
     for chat in list(bot._chats.values()):
         if chat.worker is not None:
             await chat.worker
@@ -109,11 +148,6 @@ async def test_ignores_users_not_listed(bot, api, model):
     await idle(bot)
     assert api.calls == []
     assert model.requests == []
-
-
-async def test_only_text_is_taken(bot, api):
-    await bot.handle(message(photo=[{"file_id": "x"}]))
-    assert api.sent() == ["Only text messages are supported for now."]
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +217,229 @@ async def test_a_long_reply_is_split(bot, api, model):
     await bot.handle(message("hi"))
     await idle(bot)
     assert [len(t) for t in api.sent()] == [4096, 904]
+
+
+# ---------------------------------------------------------------------------
+# Files
+
+
+async def test_a_file_with_a_caption_goes_to_the_agent_with_it(bot, api, model, workspace):
+    api.add_file("d1", "documents/file_1.pdf", b"%PDF-1")
+    model.turns.append(text_turn("A report."))
+    await bot.handle(message(caption="summarize", document=document()))
+    await idle(bot)
+    [request] = model.requests
+    content = request[-1]["content"]
+    assert content.startswith("summarize\n\n[Files sent with this message")
+    path = re.search(r"- (uploads/\S+/report\.pdf) \(application/pdf, 6 bytes\)", content).group(1)
+    assert (workspace / path).read_bytes() == b"%PDF-1"
+    assert api.sent()[-1] == "A report."
+
+
+async def test_a_file_alone_waits_for_the_next_message(bot, api, model):
+    api.add_file("p1", "photos/file_2.jpg", b"jpegdata")
+    model.turns.append(text_turn("A cat."))
+    await bot.handle(message(photo=photo()))
+    await idle(bot)
+    assert model.requests == []
+    assert re.fullmatch(r"📎 Saved photo-\d{6}\.jpg \(8 bytes\)\. It goes to the agent with your next message\.", api.sent()[-1])
+    await bot.handle(message("what is this?"))
+    await idle(bot)
+    [request] = model.requests
+    assert request[-1]["content"].startswith("what is this?\n\n[Files sent with this message")
+    assert re.search(r"- uploads/\S+/photo-\d{6}\.jpg \(image/jpeg, 8 bytes\)", request[-1]["content"])
+
+
+async def test_text_sent_while_a_file_downloads_takes_it_along(bot, api, model):
+    api.add_file("p1", "photos/file_2.jpg", b"jpegdata")
+    api.gate = asyncio.Event()
+    model.turns.append(text_turn("ok"))
+    await bot.handle(message(photo=photo()))
+    await bot.handle(message("here it is"))
+    assert model.requests == []
+    api.gate.set()
+    await idle(bot)
+    [request] = model.requests
+    assert "photo-" in request[-1]["content"]
+
+
+async def test_commands_are_answered_while_a_file_downloads(bot, api):
+    api.add_file("p1", "photos/file_2.jpg", b"jpegdata")
+    api.gate = asyncio.Event()
+    await bot.handle(message(photo=photo()))
+    await bot.handle(message("/stop"))
+    assert api.sent() == ["Nothing is running."]
+    api.gate.set()
+    await idle(bot)
+
+
+async def test_commands_leave_held_files_for_the_next_message(bot, api, model):
+    api.add_file("p1", "photos/file_2.jpg", b"jpegdata")
+    model.turns.append(text_turn("ok"))
+    await bot.handle(message(photo=photo()))
+    await idle(bot)
+    await bot.handle(message("/new"))
+    await bot.handle(message("look"))
+    await idle(bot)
+    assert "photo-" in model.requests[0][-1]["content"]
+
+
+async def test_held_files_outlast_a_restart(bot, api, model, kilo, tmp_path):
+    api.add_file("p1", "photos/file_2.jpg", b"jpegdata")
+    await bot.handle(message(photo=photo()))
+    await idle(bot)
+    restarted = TelegramBot(
+        api, TelegramStore(tmp_path / "kilo.db"), kilo.db, kilo.runner, kilo.scheduler, kilo.run_announcer,
+        frozenset({USER}), edit_seconds=0,
+    )
+    await restarted.store.init()
+    restarted.me = bot.me
+    model.turns.append(text_turn("ok"))
+    await restarted.handle(message("look"))
+    await idle(restarted)
+    assert "photo-" in model.requests[0][-1]["content"]
+    await restarted.stop()
+
+
+async def test_a_file_too_big_for_telegram_is_not_fetched(bot, api):
+    await bot.handle(message(document=document("d9", "film.mp4", 21 * 1024 * 1024, "video/mp4")))
+    await idle(bot)
+    assert api.sent() == [
+        "film.mp4 (21.0 MB) is too big for a Telegram bot, which can only fetch files up to 20 MB. "
+        "Send it from the web terminal instead."
+    ]
+    assert not [c for c in api.calls if c[0] == "getFile"]
+
+
+async def test_a_file_over_the_upload_limit_is_not_fetched(bot, api, monkeypatch):
+    monkeypatch.setattr(settings, "kilo_upload_max_mb", 1)
+    await bot.handle(message(document=document("d9", "big.zip", 2 * 1024 * 1024, "application/zip")))
+    await idle(bot)
+    assert api.sent() == ["big.zip (2.0 MB) is larger than the upload limit of 1 MB (KILO_UPLOAD_MAX_MB)."]
+    assert not [c for c in api.calls if c[0] == "getFile"]
+
+
+async def test_a_file_without_a_size_is_checked_as_it_is_saved(bot, api, monkeypatch, workspace):
+    monkeypatch.setattr(settings, "kilo_upload_max_mb", 1)
+    api.add_file("v1", "videos/file_3.mp4", b"x" * (1024 * 1024 + 1))
+    await bot.handle(message(video={"file_id": "v1", "mime_type": "video/mp4"}))
+    await idle(bot)
+    assert api.sent() == ["The video is larger than the upload limit of 1 MB (KILO_UPLOAD_MAX_MB)."]
+    assert [p for p in workspace.rglob("*") if p.is_file()] == []
+
+
+async def test_telegram_refusing_a_big_file_is_explained(bot, api):
+    api.add_file("v1", "videos/file_3.mp4", b"")
+    api.too_big.add("v1")
+    await bot.handle(message(video={"file_id": "v1"}))
+    await idle(bot)
+    assert api.sent() == [
+        "The video is too big for a Telegram bot, which can only fetch files up to 20 MB. Send it from the web terminal instead."
+    ]
+
+
+async def test_a_failed_download_is_reported_and_nothing_held(bot, api, model):
+    api.add_file("d1", "documents/file_1.pdf", b"%PDF-1")
+    api.broken.add("d1")
+    model.turns.append(text_turn("ok"))
+    await bot.handle(message(document=document()))
+    await idle(bot)
+    assert api.sent() == ["Could not fetch report.pdf from Telegram (download: ConnectError). Send it again."]
+    await bot.handle(message("hi"))
+    await idle(bot)
+    assert model.requests[0][-1]["content"] == "hi"
+
+
+async def test_stickers_are_not_supported(bot, api):
+    await bot.handle(message(sticker={"file_id": "s1"}))
+    assert api.sent() == ["Only text and files are supported."]
+
+
+async def test_group_files_not_meant_for_the_bot_are_not_fetched(bot, api):
+    api.add_file("p1", "photos/file_2.jpg", b"jpegdata")
+    await bot.handle(group(photo=photo()))
+    await idle(bot)
+    assert api.calls == []
+
+
+async def test_a_caption_that_only_mentions_the_bot_is_held(bot, api, model):
+    api.add_file("p1", "photos/file_2.jpg", b"jpegdata")
+    await bot.handle(group(caption="@kilo_bot", photo=photo()))
+    await idle(bot)
+    assert model.requests == []
+    assert api.sent(GROUP)[-1].startswith("📎 Saved photo-")
+
+
+async def test_held_files_go_only_with_their_senders_message(bot, api, model):
+    api.add_file("p1", "photos/file_2.jpg", b"jpegdata")
+    model.turns += [text_turn("hi friend"), text_turn("a photo")]
+    await bot.handle(group(caption="@kilo_bot", photo=photo()))
+    await idle(bot)
+    await bot.handle(group("@kilo_bot hello", user=FRIEND))
+    await idle(bot)
+    await bot.handle(group("@kilo_bot what is it?"))
+    await idle(bot)
+    first, second = model.requests
+    assert "Files sent" not in first[-1]["content"]
+    assert "photo-" in second[-1]["content"] and "[Sent by Ann (@ann)" in second[-1]["content"]
+
+
+# ---------------------------------------------------------------------------
+# Albums
+
+
+async def test_an_album_is_one_message(bot, api, model):
+    for n in (1, 2, 3):
+        api.add_file(f"p{n}", f"photos/file_{n}.jpg", b"jpegdata")
+    model.turns.append(text_turn("Three photos."))
+    await bot.handle(message(caption="compare these", photo=photo("p1"), media_group_id="g1", message_id=1))
+    await bot.handle(message(photo=photo("p2"), media_group_id="g1", message_id=2))
+    await bot.handle(message(photo=photo("p3"), media_group_id="g1", message_id=3))
+    await idle(bot)
+    [request] = model.requests
+    assert request[-1]["content"].startswith("compare these\n\n[Files sent")
+    assert request[-1]["content"].count("- uploads/") == 3
+
+
+async def test_an_album_without_a_caption_is_held_with_one_reply(bot, api, model):
+    for n in (1, 2):
+        api.add_file(f"p{n}", f"photos/file_{n}.jpg", b"jpegdata")
+    await bot.handle(message(photo=photo("p1"), media_group_id="g1", message_id=1))
+    await bot.handle(message(photo=photo("p2"), media_group_id="g1", message_id=2))
+    await idle(bot)
+    assert model.requests == []
+    assert api.sent() == ["📎 Saved 2 files (16 bytes). They go to the agent with your next message."]
+
+
+async def test_text_sent_while_an_album_gathers_takes_it_along(bot, api, model):
+    for n in (1, 2):
+        api.add_file(f"p{n}", f"photos/file_{n}.jpg", b"jpegdata")
+    model.turns.append(text_turn("ok"))
+    await bot.handle(message(photo=photo("p1"), media_group_id="g1", message_id=1))
+    await bot.handle(message(photo=photo("p2"), media_group_id="g1", message_id=2))
+    await bot.handle(message("these two"))
+    await idle(bot)
+    [request] = model.requests
+    assert request[-1]["content"].startswith("these two\n\n[Files sent")
+    assert request[-1]["content"].count("- uploads/") == 2
+
+
+async def test_a_group_album_counts_when_one_item_is_meant_for_the_bot(bot, api, model):
+    for n in (1, 2):
+        api.add_file(f"p{n}", f"photos/file_{n}.jpg", b"jpegdata")
+    model.turns.append(text_turn("ok"))
+    await bot.handle(group(caption="@kilo_bot which is better?", photo=photo("p1"), media_group_id="g1", message_id=1))
+    await bot.handle(group(photo=photo("p2"), media_group_id="g1", message_id=2))
+    await idle(bot)
+    [request] = model.requests
+    assert request[-1]["content"].count("- uploads/") == 2
+
+
+async def test_a_group_album_not_meant_for_the_bot_is_not_fetched(bot, api):
+    api.add_file("p1", "photos/file_1.jpg", b"jpegdata")
+    await bot.handle(group(photo=photo("p1"), media_group_id="g1", message_id=1))
+    await idle(bot)
+    assert not [c for c in api.calls if c[0] == "getFile"]
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +649,55 @@ async def test_api_waits_out_rate_limits():
         httpx.Response(200, json={"ok": True, "result": True}),
     ]
     assert await mock_api(lambda request: replies.pop(0)).call("editMessageText") is True
+
+
+HELD_PHOTO = Attachment(path="uploads/2026-11-03/photo-1.jpg", name="photo-1.jpg", type="image/jpeg", size=10)
+HELD_DOC = Attachment(path="uploads/2026-11-03/a.pdf", name="a.pdf", type="application/pdf", size=20)
+
+
+async def test_download_streams_the_file():
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.path)
+        return httpx.Response(200, content=b"photo bytes")
+
+    assert b"".join([chunk async for chunk in mock_api(handler).download("photos/file_1.jpg")]) == b"photo bytes"
+    assert seen == ["/file/bot123:SECRET/photos/file_1.jpg"]
+
+
+async def test_download_errors_never_show_the_token():
+    def missing(request):
+        return httpx.Response(404)
+
+    def down(request):
+        raise httpx.ConnectError(f"cannot reach {request.url}")
+
+    for handler, text in ((missing, "download: HTTP 404"), (down, "download: ConnectError")):
+        with pytest.raises(TelegramError) as error:
+            async for _ in mock_api(handler).download("photos/file_1.jpg"):
+                pass
+        assert str(error.value) == text and error.value.__cause__ is None
+
+
+async def test_held_files_are_taken_once_in_order(tmp_path):
+    store = TelegramStore(tmp_path / "kilo.db")
+    await store.init()
+    await store.hold(USER, USER, [HELD_PHOTO])
+    await store.hold(USER, USER, [HELD_DOC])
+    await store.hold(GROUP, USER, [HELD_DOC])
+    assert await store.take(USER, USER) == [HELD_PHOTO, HELD_DOC]
+    assert await store.take(USER, USER) == []
+    assert await store.take(GROUP, USER) == [HELD_DOC]
+
+
+async def test_held_files_outlast_the_store(tmp_path):
+    first = TelegramStore(tmp_path / "kilo.db")
+    await first.init()
+    await first.hold(USER, USER, [HELD_PHOTO])
+    again = TelegramStore(tmp_path / "kilo.db")
+    await again.init()
+    assert await again.take(USER, USER) == [HELD_PHOTO]
 
 
 # ---------------------------------------------------------------------------

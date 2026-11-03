@@ -7,6 +7,7 @@ import {
 // Commands and their subcommands, for Tab completion.
 const COMMANDS = {
   "/session": ["list", "new", "switch", "info", "rename", "delete"],
+  "/upload": ["clear"],
   "/compact": [],
   "/tasks": [],
   "/task": ["logs"],
@@ -123,6 +124,10 @@ export async function runCommand(text, app) {
       return term.lines(help());
     case "/session":
       return session(parts, sub, app);
+    case "/upload":
+      if (sub === "clear") return app.clearPending();
+      if (!sub) return app.pickFiles();
+      return term.line("Usage: /upload | /upload clear");
     case "/compact": {
       term.line("Compacting… (summarizing a long conversation can take a minute or two; Esc stops waiting)", "dim");
       const outcome = await api.compactSession(app.sessionId, app.signal);

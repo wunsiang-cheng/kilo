@@ -109,6 +109,7 @@ def test_tool_output_limit_has_a_floor():
     ("kilo_default_timeout", 0), ("kilo_default_timeout", -1),
     ("kilo_job_catchup_minutes", -1),
     ("openrouter_reasoning_effort", "bogus"), ("openrouter_max_tokens", 0),
+    ("kilo_upload_max_mb", 0),
 ])
 def test_unusable_value_is_refused(name, value):
     with pytest.raises(ValidationError):
@@ -117,7 +118,7 @@ def test_unusable_value_is_refused(name, value):
 
 @pytest.mark.parametrize("name,value", [
     ("kilo_port", 1), ("kilo_port", 65_535), ("kilo_compact_max_tokens", 64_000),
-    ("kilo_job_catchup_minutes", 0), ("openrouter_max_tokens", 1),
+    ("kilo_job_catchup_minutes", 0), ("openrouter_max_tokens", 1), ("kilo_upload_max_mb", 1),
 ])
 def test_values_at_the_limits_are_accepted(name, value):
     assert getattr(Settings(_env_file=None, **{name: value}), name) == value

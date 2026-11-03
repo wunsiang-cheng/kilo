@@ -50,6 +50,7 @@ def history_events(
             elif msg.content != CONTINUE_AFTER_COMPACTION:
                 events.append({"event": "user_message", "data": {
                     "id": msg.id, "session_id": msg.session_id, "content": msg.content or "",
+                    "attachments": (msg.payload or {}).get("attachments") or [],
                 }})
 
         elif msg.role == MessageRole.SUMMARY:
