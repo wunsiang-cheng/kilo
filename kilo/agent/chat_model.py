@@ -16,6 +16,7 @@ class ChatModel(Protocol):
         conversation's size with this turn included
     `max_tokens` caps this one reply (a summary's) in place of the model's configured cap.
     Failures are raised, not yielded.
+    takes_images says whether user messages may carry images (image_url parts); True when that cannot be told.
     """
 
     def stream_turn(
@@ -25,3 +26,5 @@ class ChatModel(Protocol):
         tools: List[Dict[str, Any]],
         max_tokens: Optional[int] = None,
     ) -> AsyncIterator[Dict[str, Any]]: ...
+
+    async def takes_images(self) -> bool: ...

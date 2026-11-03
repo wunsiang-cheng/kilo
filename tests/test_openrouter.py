@@ -326,3 +326,55 @@ async def test_a_connection_lost_mid_reply_is_reported_not_retried(sleeps):
     with pytest.raises(OpenRouterError, match="connection reset"):
         await turn(retrying([httpx.Response(200, content=body()), ok()], requests, sleeps))
     assert len(requests) == 1
+
+
+def listing(*modalities: str):
+    body = {"data": {"id": MODEL, "name": "Muse Spark", "architecture": {"input_modalities": list(modalities)}, "endpoints": []}}
+    return lambda request: httpx.Response(200, json=body)
+
+
+def no_network(request):
+    raise httpx.ConnectError("no network")
+
+
+async def test_a_model_listed_with_image_input_takes_images():
+    requests: List[httpx.Request] = []
+    assert await client_for(listing("text", "image"), requests).takes_images() is True
+    assert requests[0].url == f"https://openrouter.ai/api/v1/models/{MODEL}/endpoints"
+    assert "authorization" not in requests[0].headers
+
+
+async def test_a_text_only_model_takes_no_images():
+    assert await client_for(listing("text")).takes_images() is False
+
+
+@pytest.mark.parametrize("responder", [
+    lambda request: httpx.Response(404, json={"error": {"message": "Model not found"}}),
+    lambda request: httpx.Response(200, content=b"not json"),
+    lambda request: httpx.Response(200, json={"data": {"architecture": {}}}),
+    lambda request: httpx.Response(200, json={"data": {"architecture": {"input_modalities": "image"}}}),
+    no_network,
+])
+async def test_when_unsure_a_model_is_taken_to_take_images(responder, caplog):
+    assert await client_for(responder).takes_images() is True
+    assert f"could not look up whether {MODEL} takes images" in caplog.text
+
+
+async def test_a_variant_of_a_model_is_looked_up_as_the_model():
+    requests: List[httpx.Request] = []
+
+    def handle(request):
+        requests.append(request)
+        return listing("text")(request)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    client = OpenRouterClient(model=f"{MODEL}:free", effort="low", api_key="test-key", http=http)
+    assert await client.takes_images() is False
+    assert requests[0].url.path == f"/api/v1/models/{MODEL}/endpoints"
+
+
+async def test_a_model_is_looked_up_once():
+    requests: List[httpx.Request] = []
+    client = client_for(listing("text", "image"), requests)
+    assert [await client.takes_images(), await client.takes_images()] == [True, True]
+    assert len(requests) == 1

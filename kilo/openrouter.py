@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import uuid
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional
 
@@ -9,7 +10,12 @@ import httpx
 
 from kilo.config import settings
 
+logger = logging.getLogger(__name__)
+
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+# What a model takes as input; public, so no key is sent.
+MODELS_URL = "https://openrouter.ai/api/v1/models"
+LOOKUP_TIMEOUT = 10.0
 # OpenRouter sends keepalive comments while the model works, so the long read timeout only trips on a dead connection.
 TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=10.0)
 # Fields of a streamed reasoning detail that arrive in pieces; every other field arrives whole.
@@ -171,6 +177,30 @@ class OpenRouterClient:
         # Tests pass a client with a mock transport.
         self._http = http or httpx.AsyncClient(timeout=TIMEOUT)
         self._sleep = sleep
+        self._takes_images: Optional[bool] = None
+
+    async def takes_images(self) -> bool:
+        """
+        Whether the model takes images, as OpenRouter lists its input; looked up once. False only when OpenRouter
+        says so: when the answer cannot be had, the model is taken to take them (the request then tells).
+        """
+        if self._takes_images is None:
+            self._takes_images = await self._look_up_images()
+        return self._takes_images
+
+    async def _look_up_images(self) -> bool:
+        model = self.model.split(":", 1)[0]  # a variant (":free") is listed as its model
+        try:
+            response = await self._http.get(f"{MODELS_URL}/{model}/endpoints", timeout=LOOKUP_TIMEOUT)
+            response.raise_for_status()
+            modalities = response.json()["data"]["architecture"]["input_modalities"]
+            if isinstance(modalities, list):
+                return "image" in modalities
+            error = "input_modalities is not a list"
+        except (httpx.HTTPError, ValueError, KeyError, TypeError) as e:
+            error = f"{type(e).__name__}: {e}"
+        logger.warning("OpenRouter: could not look up whether %s takes images (%s); assuming it does.", self.model, error)
+        return True
 
     async def stream_turn(
         self,
