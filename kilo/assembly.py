@@ -75,9 +75,9 @@ class Kilo:
 
     @cached_property
     def chat_model(self) -> ChatModel:
-        from kilo.claude import ClaudeClient
+        from kilo.openrouter import OpenRouterClient
 
-        return ClaudeClient()
+        return OpenRouterClient()
 
     @cached_property
     def mcp(self) -> MCPManager:

@@ -88,7 +88,7 @@ async def health_check() -> Dict[str, Any]:
     return {
         "status": "healthy",
         "agent": "Kilo",
-        "model": settings.anthropic_model,
+        "model": settings.openrouter_model,
         "compact_at_tokens": settings.kilo_compact_at_tokens,
         "timezone": settings.kilo_timezone,
         "workspace": str(settings.kilo_workspace),
@@ -101,6 +101,9 @@ async def health_check() -> Dict[str, Any]:
 
 def main():
     """Start uvicorn server directly."""
+    if not settings.openrouter_api_key:
+        # Every reply would fail; say so now rather than at the first message.
+        raise SystemExit("OPENROUTER_API_KEY is not set: put your OpenRouter API key in .env (see .env.example).")
     if settings.kilo_password == DEFAULT_PASSWORD:
         if not is_local(settings.kilo_host):
             # Anyone who has read the code could log in and use the agent's shell.

@@ -1,5 +1,5 @@
 """
-Real Claude API calls, with the key from the project's `.env`. They cost a little, so they run only when asked:
+Real OpenRouter API calls, with the key from the project's `.env`. They cost a little, so they run only when asked:
 
     uv run pytest -m live
 """
@@ -11,34 +11,31 @@ import sys
 import time
 from pathlib import Path
 
-import anthropic
 import httpx
 import pytest
 from dotenv import dotenv_values
 
 from kilo.assembly import Kilo
-from kilo.claude import ClaudeClient
 from kilo.config import DEFAULT_PASSWORD, DEFAULT_USERNAME
+from kilo.openrouter import OpenRouterClient
 
 pytestmark = pytest.mark.live
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-MODEL = "claude-sonnet-5-5"
+MODEL = "meta/muse-spark-1.3-contributor"
 
 
 @pytest.fixture(scope="module")
 def api_key() -> str:
-    key = dotenv_values(ROOT / ".env").get("ANTHROPIC_API_KEY")
+    key = dotenv_values(ROOT / ".env").get("OPENROUTER_API_KEY")
     if not key:
-        pytest.fail("Set ANTHROPIC_API_KEY in .env to run the live tests.")
+        pytest.fail("Set OPENROUTER_API_KEY in .env to run the live tests.")
     return key
 
 
 @pytest.fixture
 async def live_kilo(tmp_path, workspace, api_key):
-    client = ClaudeClient(
-        model=MODEL, effort="low", max_tokens=2048, client=anthropic.AsyncAnthropic(api_key=api_key),
-    )
+    client = OpenRouterClient(model=MODEL, effort="low", api_key=api_key)
     built = Kilo(data_dir=tmp_path, chat_model=client)
     await built.init()
     yield built
@@ -94,7 +91,7 @@ def real_server(tmp_path, api_key):
     """`kilo-server`'s entry point in a process of its own, with the defaults of .env.example for the model."""
     port = free_port()
     env = {
-        **os.environ, "ANTHROPIC_API_KEY": api_key, "KILO_PORT": str(port), "KILO_WORKSPACE": str(tmp_path / "ws"),
+        **os.environ, "OPENROUTER_API_KEY": api_key, "KILO_PORT": str(port), "KILO_WORKSPACE": str(tmp_path / "ws"),
         "KILO_DATA_DIR": str(tmp_path / "data"), "KILO_MCP_CONFIG": str(tmp_path / "data" / "mcp_servers.json"),
     }
     process = subprocess.Popen(
@@ -134,3 +131,10 @@ def test_real_server_process(real_server):
             json={"message": "Reply with exactly the word KIWI and nothing else.", "stream": False},
         ).json()
         assert "KIWI" in reply["response"], reply["events"][-1]
+
+        tooled = http.post(
+            f"/api/v1/sessions/{session['id']}/chat",
+            json={"message": "Use the shell tool to run `echo KILO-OK`, then reply with its output only.", "stream": False},
+        ).json()
+        assert "tool_call_result" in [event["event"] for event in tooled["events"]], tooled["events"][-1]
+        assert "KILO-OK" in tooled["response"]
