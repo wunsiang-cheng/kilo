@@ -7,6 +7,7 @@ from typing import Any, Callable
 
 import docx
 import openpyxl
+import pptx
 from PIL import Image
 
 
@@ -45,4 +46,12 @@ def with_saved_value(path: Path, formula: str, value: str) -> Path:
     with zipfile.ZipFile(path, "w") as target:
         for name, data in entries.items():
             target.writestr(name, data)
+    return path
+
+
+def presentation(path: Path, build: Callable[[Any], Any]) -> Path:
+    """A PowerPoint presentation that `build` fills (it gets a python-pptx Presentation)."""
+    deck = pptx.Presentation()
+    build(deck)
+    deck.save(str(path))
     return path

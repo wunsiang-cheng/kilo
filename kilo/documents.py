@@ -19,7 +19,10 @@ import docx
 import docx.table
 import docx.text.paragraph
 import openpyxl
+import pptx
 from openpyxl.utils import get_column_letter
+from pptx.enum.shapes import MSO_SHAPE_TYPE
+from pptx.shapes.picture import Picture
 
 from kilo.config import settings
 
@@ -280,9 +283,67 @@ def _xlsx_lines(path: Path) -> Iterator[str]:
         book.close()
 
 
+# PowerPoint
+
+
+def _slide_text(text: str) -> str:
+    """Text on a slide, its line breaks (a vertical tab, as python-pptx gives them) as newlines."""
+    return text.replace("\x0b", "\n").strip()
+
+
+def _in_reading_order(shapes: Iterable[Any]) -> List[Any]:
+    """Shapes from top to bottom, then left to right; one placed by its layout (no position of its own) as at 0."""
+    return sorted(shapes, key=lambda shape: (shape.top or 0, shape.left or 0))
+
+
+def _shape_lines(shape: Any) -> List[str]:
+    """What a shape shows, as lines: a group's shapes in reading order, a table, a picture or chart's mark, its text."""
+    if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+        return [line for inner in _in_reading_order(shape.shapes) for line in _shape_lines(inner)]
+    if isinstance(shape, Picture):
+        description = shape._element.nvPicPr.cNvPr.get("descr")
+        return [f"[Picture: {description}]" if description else "[Picture]"]
+    if shape.has_chart:
+        chart = shape.chart
+        has_title = chart.has_title and chart.chart_title.has_text_frame
+        title = _slide_text(chart.chart_title.text_frame.text) if has_title else ""
+        return [f"[Chart: {title}]" if title else "[Chart]"]
+    if shape.has_table:
+        return _table([[_slide_text(cell.text) for cell in row.cells] for row in shape.table.rows])
+    if shape.has_text_frame:
+        return [
+            ("  " * (paragraph.level - 1) + "- " if paragraph.level else "") + text
+            for paragraph in shape.text_frame.paragraphs
+            if (text := _slide_text(paragraph.text))
+        ]
+    return []
+
+
+def _pptx_lines(path: Path) -> Iterator[str]:
+    """Each slide under its number and title: its shapes in reading order, then its speaker notes."""
+    for number, slide in enumerate(pptx.Presentation(str(path)).slides, 1):
+        title_shape = slide.shapes.title
+        title = ""
+        if title_shape is not None and title_shape.has_text_frame:
+            title = title_shape.text_frame.text.replace("\x0b", " ").replace("\n", " ").strip()
+        heading = f"## Slide {number}: {title}" if title else f"## Slide {number}"
+        yield heading + (" (hidden)" if slide._element.get("show") == "0" else "")
+        shapes = [shape for shape in slide.shapes if title_shape is None or shape.shape_id != title_shape.shape_id]
+        content = [line for shape in _in_reading_order(shapes) for line in _shape_lines(shape)]
+        if slide.has_notes_slide and slide.notes_slide.notes_text_frame is not None:
+            notes = _slide_text(slide.notes_slide.notes_text_frame.text)
+            if notes:
+                content += ["Notes:", notes]
+        if content:
+            yield ""
+            yield from content
+        yield ""
+
+
 KINDS: Dict[str, Kind] = {
     ".docx": Kind("docx", "a Word document", _docx_lines, zipped=True),
     ".xlsx": Kind("xlsx", "an Excel workbook", _xlsx_lines, zipped=True),
+    ".pptx": Kind("pptx", "a PowerPoint presentation", _pptx_lines, zipped=True),
 }
 
 

@@ -10,9 +10,12 @@ import pytest
 from docx.oxml import parse_xml
 from docx.oxml.ns import nsdecls
 from docx.shared import Inches
+from pptx.chart.data import CategoryChartData
+from pptx.enum.chart import XL_CHART_TYPE
+from pptx.util import Inches as SlideInches
 
 from kilo import documents
-from samples import png_bytes, with_saved_value, word, workbook
+from samples import png_bytes, presentation, with_saved_value, word, workbook
 
 pytestmark = pytest.mark.usefixtures("data_dir")
 DAY = 86400
@@ -218,3 +221,72 @@ def test_a_long_sheet_stops_at_the_limit(tmp_path, monkeypatch):
     text = text_of(workbook(tmp_path / "long.xlsx", build))
     assert text.endswith("[Conversion stopped here: the text passed 200 characters. The rest of the file is not included.]\n")
     assert "| 1000 |" not in text
+
+
+def test_a_slide_reads_from_top_to_bottom_then_left_to_right(tmp_path):
+    def build(deck):
+        slide = deck.slides.add_slide(deck.slide_layouts[5])  # title only
+        slide.shapes.title.text = "季度結果"
+        for left, text in ((5, "Right"), (1, "Left")):
+            slide.shapes.add_textbox(SlideInches(left), SlideInches(2), SlideInches(3), SlideInches(1)).text_frame.text = text
+        frame = slide.shapes.add_textbox(SlideInches(1), SlideInches(4), SlideInches(3), SlideInches(2)).text_frame
+        frame.text = "Points"
+        for level, text in ((1, "Revenue up"), (2, "In Asia")):
+            paragraph = frame.add_paragraph()
+            paragraph.text, paragraph.level = text, level
+        broken = frame.add_paragraph()
+        broken.text = "one"
+        broken.add_line_break()
+        broken.add_run().text = "two"
+
+    assert text_of(presentation(tmp_path / "deck.pptx", build)) == "\n".join([
+        "## Slide 1: 季度結果", "",
+        "Left", "Right", "Points", "- Revenue up", "  - In Asia", "one\ntwo", "",
+    ])
+
+
+def test_tables_pictures_charts_notes_and_hidden_slides(tmp_path):
+    def build(deck):
+        slide = deck.slides.add_slide(deck.slide_layouts[6])  # blank: no title
+        table = slide.shapes.add_table(2, 2, SlideInches(1), SlideInches(1), SlideInches(4), SlideInches(1)).table
+        for (row, column), text in {(0, 0): "Item", (0, 1): "Qty", (1, 0): "Pen", (1, 1): "3"}.items():
+            table.cell(row, column).text = text
+        picture = slide.shapes.add_picture(png_bytes(), SlideInches(1), SlideInches(3))
+        picture._element.nvPicPr.cNvPr.set("descr", "Logo")
+        data = CategoryChartData()
+        data.categories = ["Q1"]
+        data.add_series("Sales", (1,))
+        chart = slide.shapes.add_chart(
+            XL_CHART_TYPE.COLUMN_CLUSTERED, SlideInches(1), SlideInches(5), SlideInches(4), SlideInches(2), data,
+        ).chart
+        chart.has_title = True
+        chart.chart_title.text_frame.text = "Sales"
+        slide.notes_slide.notes_text_frame.text = "Say it slowly"
+        slide._element.set("show", "0")
+
+    assert text_of(presentation(tmp_path / "parts.pptx", build)) == "\n".join([
+        "## Slide 1 (hidden)", "",
+        "| Item | Qty |", "| --- | --- |", "| Pen | 3 |",
+        "[Picture: Logo]", "[Chart: Sales]", "Notes:", "Say it slowly", "",
+    ])
+
+
+def test_grouped_shapes_are_read_where_the_group_is(tmp_path):
+    def build(deck):
+        slide = deck.slides.add_slide(deck.slide_layouts[6])
+        group = slide.shapes.add_group_shape()
+        for top, text in ((3, "In group, lower"), (1, "In group, upper")):
+            group.shapes.add_textbox(SlideInches(1), SlideInches(top), SlideInches(2), SlideInches(1)).text_frame.text = text
+        slide.shapes.add_textbox(SlideInches(1), SlideInches(5), SlideInches(2), SlideInches(1)).text_frame.text = "Outside"
+
+    assert text_of(presentation(tmp_path / "group.pptx", build)) == "\n".join([
+        "## Slide 1", "", "In group, upper", "In group, lower", "Outside", "",
+    ])
+
+
+def test_slides_follow_one_another(tmp_path):
+    def build(deck):
+        for title in ("One", "Two"):
+            deck.slides.add_slide(deck.slide_layouts[5]).shapes.title.text = title
+
+    assert text_of(presentation(tmp_path / "two.pptx", build)) == "## Slide 1: One\n\n## Slide 2: Two\n"
