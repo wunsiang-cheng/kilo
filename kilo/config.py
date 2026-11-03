@@ -23,6 +23,12 @@ class Settings(BaseSettings):
     anthropic_effort: Literal["low", "medium", "high", "xhigh", "max"] = "high"
     anthropic_max_tokens: int = Field(128000, ge=1, le=MAX_OUTPUT_TOKENS)
 
+    # The model, through OpenRouter.
+    openrouter_api_key: Optional[str] = None
+    openrouter_model: str = "meta/muse-spark-1.3-contributor"
+    openrouter_reasoning_effort: Literal["max", "xhigh", "high", "medium", "low", "minimal", "none"] = "high"
+    openrouter_max_tokens: Optional[int] = Field(None, ge=1)
+
     # Server Settings
     kilo_host: str = "127.0.0.1"
     kilo_port: int = Field(8000, ge=1, le=65535)

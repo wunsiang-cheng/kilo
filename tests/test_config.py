@@ -100,6 +100,7 @@ def test_tool_output_limit_has_a_floor():
     ("kilo_compact_max_tokens", 0), ("kilo_compact_max_tokens", 64_001),
     ("kilo_default_timeout", 0), ("kilo_default_timeout", -1),
     ("kilo_job_catchup_minutes", -1),
+    ("openrouter_reasoning_effort", "bogus"), ("openrouter_max_tokens", 0),
 ])
 def test_unusable_value_is_refused(name, value):
     with pytest.raises(ValidationError):
@@ -108,10 +109,17 @@ def test_unusable_value_is_refused(name, value):
 
 @pytest.mark.parametrize("name,value", [
     ("kilo_port", 1), ("kilo_port", 65_535), ("anthropic_max_tokens", 128_000), ("kilo_compact_max_tokens", 64_000),
-    ("kilo_job_catchup_minutes", 0),
+    ("kilo_job_catchup_minutes", 0), ("openrouter_max_tokens", 1),
 ])
 def test_values_at_the_limits_are_accepted(name, value):
     assert getattr(Settings(_env_file=None, **{name: value}), name) == value
+
+
+def test_openrouter_defaults():
+    defaults = Settings(_env_file=None)
+    assert defaults.openrouter_model == "meta/muse-spark-1.3-contributor"
+    assert defaults.openrouter_reasoning_effort == "high"
+    assert defaults.openrouter_api_key is None and defaults.openrouter_max_tokens is None
 
 
 def test_line_settings_refuse_an_unknown_timezone():
