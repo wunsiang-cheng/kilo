@@ -200,6 +200,17 @@ async def test_blank_arguments_mean_no_arguments(kilo, model, session):
     assert "Invalid arguments" not in json.dumps(events[2]["data"]["result"])
 
 
+@pytest.mark.parametrize("raw,sent_back", [
+    ('{"pattern": "*"}', '{"pattern": "*"}'),  # a JSON object goes back exactly as the model wrote it
+    ("", "{}"), ("{not json", "{}"), ('{"pattern": "*', "{}"), ("[1, 2]", "{}"),  # providers refuse these in history
+])
+async def test_tool_call_arguments_go_back_as_a_json_object(kilo, model, session, raw, sent_back):
+    model.turns.extend([tool_turn("c1", "glob", raw), text_turn("ok")])
+    await collect(kilo, session.id, "go")
+    [call] = model.requests[1][1]["tool_calls"]
+    assert call["function"]["arguments"] == sent_back
+
+
 async def test_first_message_titles_session(kilo, model, session):
     model.turns.append(text_turn("ok"))
     await collect(kilo, session.id, "Fix the build\nand more")

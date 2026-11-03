@@ -66,6 +66,25 @@ def _parse_tool_arguments(raw: Any) -> Tuple[Dict[str, Any], Optional[str]]:
     return raw, None
 
 
+def _replayable(message: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    An assistant turn as it is stored, to be sent back: each tool call's arguments as the model wrote them when
+    they are a JSON object, else "{}". Some providers refuse a request whose history holds blank, cut-off or
+    malformed arguments, which would fail every later turn of the session; the call's result says what was wrong.
+    """
+    calls = message.get("tool_calls")
+    if not calls:
+        return message
+    replayable = []
+    for call in calls:
+        function = call.get("function") or {}
+        raw = function.get("arguments")
+        args, error = _parse_tool_arguments(raw)
+        kept = raw if error is None and isinstance(raw, str) and raw.strip() else json.dumps(args)
+        replayable.append({**call, "function": {**function, "arguments": kept}})
+    return {**message, "tool_calls": replayable}
+
+
 INTERRUPTED_TOOL_RESULT = "Tool call was interrupted before it returned a result."
 
 
@@ -365,7 +384,7 @@ class AgentRunner:
                     session_id=session_id,
                     role=MessageRole.ASSISTANT,
                     content=message.get("content") or None,
-                    payload=message,
+                    payload=_replayable(message),
                 )
 
             if tool_calls:

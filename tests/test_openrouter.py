@@ -193,6 +193,13 @@ async def test_finish_reason_error_is_raised():
         await turn(client_for(streaming(sse(chunk({"content": "par"}), chunk({}, finish="error")))))
 
 
+@pytest.mark.parametrize("line", [b'data: {"choices":[{"delta":{"con', b"data: 42\n\n"])  # cut off; not an object
+async def test_an_unreadable_chunk_is_reported(line):
+    body = sse(chunk({"content": "par"})).replace(b"data: [DONE]\n\n", line)
+    with pytest.raises(OpenRouterError, match="unreadable data in the reply stream"):
+        await turn(client_for(streaming(body)))
+
+
 async def test_a_stream_that_ends_before_the_reply_finishes_is_raised():
     with pytest.raises(OpenRouterError, match="ended before the reply finished"):
         await turn(client_for(streaming(sse(chunk({"content": "par"})))))

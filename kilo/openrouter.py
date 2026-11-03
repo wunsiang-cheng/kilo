@@ -52,6 +52,17 @@ async def _http_error(response: httpx.Response) -> OpenRouterError:
     return OpenRouterError(message, response.status_code)
 
 
+def _chunk(data: str) -> Dict[str, Any]:
+    """One streamed chunk; a line cut off (the connection closed mid-chunk) or garbled raises OpenRouterError."""
+    try:
+        chunk = json.loads(data)
+    except ValueError as e:
+        raise OpenRouterError(f"unreadable data in the reply stream ({e}): {data[:200]}") from e
+    if not isinstance(chunk, dict):
+        raise OpenRouterError(f"unreadable data in the reply stream (not a JSON object): {data[:200]}")
+    return chunk
+
+
 def _retry_delay(response: httpx.Response, attempt: int) -> float:
     """Seconds to wait before retrying: the response's Retry-After when it is a short delay in seconds, else the backoff."""
     try:
@@ -203,7 +214,7 @@ class OpenRouterClient:
                 data = line[len("data:"):].strip()
                 if data == "[DONE]":
                     break
-                for event in reply.add(json.loads(data)):
+                for event in reply.add(_chunk(data)):
                     yield event
         except httpx.TransportError as e:
             raise OpenRouterError(f"the connection broke during the reply ({type(e).__name__}: {e})") from e
